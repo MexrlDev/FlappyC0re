@@ -1,0 +1,46 @@
+Flappy Bird Luac0re PS4/PS5 port
+Copyright (c) w2026 MexrlDev
+License: MIT
+
+Third-party components and inspirations
+---------------------------------------
+
+Flappy Bird sprites and audio
+  Copyright (c) 2019 Samuel Custodio
+  Source: https://github.com/samuelcust/flappy-bird-assets
+  License: MIT
+  Files: assets/*.png, assets/*.wav
+  Notice: assets/Credits.txt
+
+Doom-PS (ps5-doom)
+  Copyright (c) 2026 MexrlDev
+  License: MIT
+  Role: The platform-layer approach used here (single flat RWX mmap,
+        streamed .bin over TCP, .ps_persist linker section) is the
+        same pattern as Doom-PS. Both projects share an author.
+
+DooMC0re
+  Copyright (c) EgyDevTeam / egycnq
+  Source: https://github.com/egycnq/EmuC0re
+  License: GPL-2.0
+  Role: Architectural inspiration only. Specific ideas borrowed at the
+        design level — the native_call trampoline calling convention,
+        the .ps_persist / BSS-wipe-survival pattern, and the streamed-
+        shellcode launcher — were originally developed or popularised
+        by DooMC0re.
+
+        NO DooMC0re SOURCE CODE IS INCLUDED IN THIS REPOSITORY.
+        Every line of C, Lua, and Python here was written independently
+        for this port. If a future change does copy code from DooMC0re,
+        that file must be relicensed GPL-2.0-or-later and this NOTICE
+        updated accordingly.
+
+LuaC0re exploit framework (external dependency, not bundled)
+  Copyright (c) Gezine
+  Source: https://github.com/Gezine/Luac0re
+  License: see upstream
+
+8x8 bitmap font
+  The glyph table in src/font.h was typed out fresh for this port from
+  the standard 8x8 console font geometry. It is not copied from any
+  GPL source.
