@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 set -e
-mkdir -p assets
+
+# Auto-fetch assets if the directory is empty
 if [ ! -f assets/background-day.png ]; then
-  echo "Please put your Flappy Bird PNGs and WAVs into ./assets/"
-  echo "Required files:"
-  echo "  background-day.png  background-night.png  base.png"
-  echo "  pipe-green-top.png  pipe-green.png"
-  echo "  yellowbird-downflap.png  yellowbird-midflap.png  yellowbird-upflap.png"
-  echo "  gameover.png"
-  echo "  jump.wav  score.wav  hit.wav"
-  exit 1
+  echo "Assets missing — fetching from MexrlDev/PsVue-Mod..."
+  ./tools/fetch_assets.sh assets
 fi
+
+# Sanity check
+missing=0
+for f in background-day.png background-night.png base.png \
+         gameover.png hit.wav jump.wav \
+         pipe-green-top.png pipe-green.png score.wav \
+         yellowbird-downflap.png yellowbird-midflap.png yellowbird-upflap.png; do
+  [ -f "assets/$f" ] || { echo "MISSING assets/$f"; missing=1; }
+done
+[ "$missing" -eq 0 ] || exit 1
+
 make clean
 make -j"$(nproc)"
 make hex
+
 echo
-echo "Built flappy.bin ($(stat -c%s flappy.bin) bytes)"
+echo "Built flappy.bin ($(stat -c%s flappy.bin 2>/dev/null || stat -f%z flappy.bin) bytes)"
