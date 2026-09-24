@@ -21,4 +21,8 @@ void render_text(int x, int y, const char *s, u32 argb, int scale);
 void render_text_center(int y, const char *s, u32 argb, int scale);
 int  render_text_width(const char *s, int scale);
 
+/* Fixed-point (8.8) variants — scale_fp = scale * 256. */
+void render_blit_scaled_fp(int id, float xf, float yf, int scale_fp, u8 alpha);
+void render_blit_scaled_bg_fp(int id, float xf, int scale_fp);
+
 #endif
