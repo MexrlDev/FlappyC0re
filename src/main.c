@@ -167,22 +167,19 @@ static u32 pad_pressed(void) {
     return p;
 }
 
-/* ---------------- lightbar (stack-local struct) ---------------- */
+/* ---------------- lightbar ---------------- */
 
 static void lightbar(u8 r, u8 g, u8 b) {
     if (pad_h < 0 || !pad_lb_fn) return;
     struct { u8 r, g, b, x; } col;
-    col.r = r;
-    col.g = g;
-    col.b = b;
-    col.x = 0;
+    col.r = r; col.g = g; col.b = b; col.x = 0;
     NC(G, pad_lb_fn, (u64)pad_h, (u64)&col, 0,0,0,0);
 }
 
-static const u32 LB_MENU    = 0xFFDC00u;   /* yellow */
-static const u32 LB_PLAYING = 0xFFDC00u;   /* yellow */
-static const u32 LB_DEAD    = 0xFF0000u;   /* red */
-static const u32 LB_DEFAULT = 0x0000C8u;   /* Sony soft blue */
+static const u32 LB_MENU    = 0xFFDC00u;
+static const u32 LB_PLAYING = 0xFFDC00u;
+static const u32 LB_DEAD    = 0xFF0000u;
+static const u32 LB_DEFAULT = 0x0000C8u;
 
 static void lightbar_apply(u32 rgb) {
     lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
@@ -208,20 +205,9 @@ static void haptic_raw(u8 large, u8 small) {
     NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
 }
 
-static void haptic_low_pulse(void) {
-    haptic_raw(80, 80);
-    haptic_until_ms = now_ms() + 40;
-}
-
-static void haptic_death(void) {
-    haptic_raw(255, 255);
-    haptic_until_ms = now_ms() + 1000;
-}
-
-static void haptic_restart(void) {
-    haptic_raw(128, 128);
-    haptic_until_ms = now_ms() + 200;
-}
+static void haptic_low_pulse(void) { haptic_raw(80, 80);   haptic_until_ms = now_ms() + 40;   }
+static void haptic_death(void)     { haptic_raw(255, 255); haptic_until_ms = now_ms() + 1000; }
+static void haptic_restart(void)   { haptic_raw(128, 128); haptic_until_ms = now_ms() + 200;  }
 
 static void haptic_tick(void) {
     if (haptic_until_ms && now_ms() >= haptic_until_ms) {
@@ -396,8 +382,6 @@ static void pad_init_from(void) {
     if (pad_h >= 0 && pad_vib_fn)
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
 
-    /* Yellow lightbar as soon as we take over.  Try a few times in case
-       the pad handle needs a moment to fully attach. */
     for (int i = 0; i < 5; i++) {
         lightbar_apply(LB_MENU);
         sleep_ms(30);
@@ -483,28 +467,44 @@ static void draw_menu(void) {
     render_text(40, 990, hi, 0xFF404040u, 3);
 }
 
+/* ---- draw_playing ---- */
 static void draw_playing(void) {
     int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
-    render_blit_scaled_bg(bg, game.bg_scroll - 1728.0f, 6.0f);
-    render_blit_scaled_bg(bg, game.bg_scroll, 6.0f);
 
-    for (int i = 0; i < game.active_count; i++) {
-        struct pipe_pair *p = game.active[i];
-        render_blit_scaled(A_PIPE_TOP, p->x, p->y_top - 320.0f * 6.0f, 6.0f, 255);
-        render_blit_scaled(A_PIPE_BOT, p->x, p->y_bot,               6.0f, 255);
+    /* Background tiles: enough copies to cover 1920 px.
+       bg_scroll is in [-BG_W, 0]. */
+    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 1;   /* ~4-5 */
+    for (int i = 0; i < bg_copies; i++) {
+        render_blit_scaled_bg_fp(bg, game.bg_scroll + (float)(i * BG_W),
+                                 GAME_SCALE_FP);
     }
 
-    int bw = 336 * 6;
-    int bx = ((int)game.base_scroll) % bw;
-    if (bx > 0) bx -= bw;
-    for (int x = bx; x < SCR_W; x += bw)
-        render_blit_scaled(A_BASE, (float)x, 1080.0f - 236.0f, 6.0f, 255);
+    /* Pipes — top pipe bottom edge sits at p->y_top, bottom pipe top at p->y_bot */
+    for (int i = 0; i < game.active_count; i++) {
+        struct pipe_pair *p = game.active[i];
+        render_blit_scaled_fp(A_PIPE_TOP, p->x, p->y_top - (float)PIPE_H,
+                              GAME_SCALE_FP, 255);
+        render_blit_scaled_fp(A_PIPE_BOT, p->x, p->y_bot,
+                              GAME_SCALE_FP, 255);
+    }
 
+    /* Ground / base tiles */
+    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 1;   /* ~4 */
+    for (int i = 0; i < base_copies; i++) {
+        render_blit_scaled_fp(A_BASE,
+                              game.base_scroll + (float)(i * BASE_W),
+                              (float)(SCR_H - GROUND_H),
+                              GAME_SCALE_FP, 255);
+    }
+
+    /* Bird */
     int bird_asset = A_BIRD_MID;
     if (game.bird_vy < -120.0f)      bird_asset = A_BIRD_UP;
     else if (game.bird_vy > 120.0f)  bird_asset = A_BIRD_DOWN;
-    render_blit_scaled(bird_asset, 300.0f, game.bird_y, 6.0f, 255);
+    render_blit_scaled_fp(bird_asset, BIRD_X_POS, game.bird_y,
+                          GAME_SCALE_FP, 255);
 
+    /* Score text */
     char s[32];
     snprintf(s, sizeof(s), "SCORE: %d", game.score);
     render_text(40, 40, s, 0xFFFFFFFFu, 5);
@@ -512,8 +512,13 @@ static void draw_playing(void) {
     render_text(40, 100, s, 0xFFFFC030u, 4);
 }
 
+/* ---- draw_gameover ---- */
 static void draw_gameover(void) {
-    render_text_center(400, "GAME OVER", 0xFFFF3030u, 10);
+    /* GAME OVER banner image, centered horizontally at y ≈ 440 */
+    int gx = (SCR_W - GAMEOVER_W) / 2;
+    render_blit_scaled_fp(A_GAMEOVER, (float)gx, (float)(SCR_H / 2 - 100),
+                          384 /* 1.5 * 256 */, 255);
+
     char s[64];
     snprintf(s, sizeof(s), "SCORE: %d", game.score);
     render_text_center(560, s, 0xFFFFFFFFu, 6);
@@ -522,6 +527,7 @@ static void draw_gameover(void) {
     render_text_center(900, "X RESTART   O BACK", 0xFFC0C0C0u, 4);
 }
 
+/* ---- draw_ready ---- */
 static void draw_ready(void) {
     draw_playing();
     render_text_center(280, "GET READY",   0xFFFFC030u, 10);
@@ -586,7 +592,6 @@ static void menu_update(u32 pressed) {
             game.show_credits = 1;
             break;
         case 7:
-            /* Signal the main loop to tear down and return to LuaC0re. */
             save_write(&game);
             g_exit_now = 1;
             break;
@@ -600,6 +605,8 @@ PERSIST static enum gstate last_gstate = 0xFF;
 
 static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state != last_gstate) {
+        printf("STATE %d -> %d (f=%u)\n",
+               (int)last_gstate, (int)game.state, (unsigned)total_frames);
         if (game.state == GS_GAMEOVER) {
             haptic_death();
             lightbar_apply(LB_DEAD);
@@ -667,21 +674,17 @@ static void *audio_thread_entry(void *arg) {
 /* ---------------- cleanup ---------------- */
 
 static void cleanup_and_return(struct ext_args_lua *ext) {
-    /* 1. Kill vibration */
     if (pad_h >= 0 && pad_vib_fn) {
         vib_data[0] = 0; vib_data[1] = 0;
         for (int i = 2; i < 8; i++) vib_data[i] = 0;
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
     }
 
-    /* 2. Restore Sony soft-blue lightbar */
     lightbar_apply(LB_DEFAULT);
     sleep_ms(80);
 
-    /* 3. Stop audio */
     audio_shutdown();
 
-    /* 4. Blank the screen so the next payload starts on a clean slate */
     if (fbs_mem) {
         u32 *fb0 = (u32*)fbs_mem;
         u32 *fb1 = (u32*)(fbs_mem + FB_ALIGNED);
@@ -691,15 +694,12 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
         sleep_ms(50);
     }
 
-    /* 5. Close video */
     if (vid_close && video_h >= 0)
         NC(G, vid_close, (u64)video_h, 0,0,0,0,0);
 
-    /* 6. Delete event queue */
     if (delete_eq && eq)
         NC(G, delete_eq, eq, 0,0,0,0,0);
 
-    /* 7. Tell the Lua side we finished cleanly */
     ext->status = 0;
     ext->step   = 99;
     ext->frame  = (u32)total_frames;
@@ -764,6 +764,11 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), (int)g_user_id);
 
+    /* ---- Layout report so you can sanity-check on-device ---- */
+    printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
+           BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
+           BIRD_W, BIRD_H, GROUND_H, GAME_SCALE_FP);
+
     void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
     if (pc) {
         u64 tid = 0;
@@ -774,6 +779,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     pad_prev = read_pad();
 
     u32 last_ms = now_ms();
+    u32 prev_raw_logged = 0;
 
     while (!g_exit_now) {
         u32 cur_ms = now_ms();
@@ -785,14 +791,24 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         haptic_tick();
 
-        /* Light pad logging for the first 5 s only. */
-        if (total_frames < 300 && (total_frames % 60) == 0) {
-            u32 raw = read_pad();
-            printf("PAD f=%u raw=%08x state=%d\n",
+        /* ---- Debug: log every raw pad change ---- */
+        u32 raw = read_pad();
+        if (raw != prev_raw_logged) {
+            printf("PAD f=%u raw=%08x st=%d\n",
                    (unsigned)total_frames, raw, (int)game.state);
+            prev_raw_logged = raw;
         }
 
-        u32 pressed = pad_pressed();
+        /* ---- Debug: periodic game state dump for the first ~10 s ---- */
+        if (total_frames < 600 && (total_frames % 30) == 0) {
+            printf("DBG f=%u st=%d bird_y=%.1f vy=%.1f pipes=%d spd=%.2f sc=%d\n",
+                   (unsigned)total_frames, (int)game.state,
+                   game.bird_y, game.bird_vy,
+                   game.active_count, game.pipe_speed, game.score);
+        }
+
+        u32 pressed = raw & ~pad_prev;
+        pad_prev = raw;
 
         if (game.state == GS_MENU) {
             menu_update(pressed);
@@ -807,8 +823,5 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "EXIT\n", 5);
     cleanup_and_return(ext);
-
-    /* Return to LuaC0re.  The Lua script ends after func_wrap, so control
-       passes back to the loader. */
     return;
 }
