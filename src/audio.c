@@ -4,7 +4,8 @@
 extern const u8 asset_blob[];
 
 #define NUM_VOICES 32
-#define GRAIN 1024
+#define GRAIN      2048
+#define FADE_LEN   256        /* ~5.3 ms at 48 kHz */
 
 struct voice {
     const s16 *pcm;
@@ -26,7 +27,7 @@ int audio_init(s32 h, void *fn, void *G) {
     gadget = G;
     for (int i = 0; i < NUM_VOICES; i++) voices[i].active = 0;
 
-    /* Prime the device with three silent buffers so the first real
+    /* Prime the device with several silent buffers so the first real
        sound request doesn't stall while the hardware spins up. */
     if (h >= 0 && fn) {
         static s16 silence[GRAIN * 2];
@@ -48,8 +49,6 @@ void audio_play(enum asset_id id, float vol) {
     const struct asset *a = &asset_table[id];
     if (a->fmt != ASSET_FMT_S16_MONO_48K) return;
 
-    /* Prefer a free voice.  If none, steal the OLDEST (largest pos) so
-       freshly-started sounds are never cut off mid-playback. */
     int slot = -1;
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!voices[i].active) { slot = i; break; }
@@ -80,8 +79,26 @@ void audio_mix_tick(void) {
                 voices[v].active = 0;
                 continue;
             }
-            float s = voices[v].pcm[voices[v].pos++];
-            acc += (int)(s * voices[v].vol);
+
+            s32 sample = voices[v].pcm[voices[v].pos];
+
+            /* Fade-in / fade-out envelope to eliminate clicks at the
+               start and end of every voice.  This is the "cutting"
+               artifact — hard starts and hard stops of the source WAV. */
+            float gain = voices[v].vol;
+            u32 pos = voices[v].pos;
+            u32 len = voices[v].len;
+
+            if (pos < FADE_LEN) {
+                gain *= (float)pos / (float)FADE_LEN;
+            }
+            u32 rem = len - pos;
+            if (rem < FADE_LEN) {
+                gain *= (float)rem / (float)FADE_LEN;
+            }
+
+            voices[v].pos++;
+            acc += (int)(sample * gain);
         }
         if (acc > 32767)  acc = 32767;
         if (acc < -32768) acc = -32768;
