@@ -470,24 +470,42 @@ static void audio_init_from(void) {
     audio_init(h, g_aud_out_fn, G);
 }
 
+/* Retries the new port open up to 8 times with 150 ms pauses between
+   attempts.  sceAudioOutClose returns success immediately but the
+   kernel holds the port for ~1 second while the audio queue drains.
+   Without the retry, rapid port switching always fails and the menu
+   looks stuck. */
 static void audio_restart_with_port(u8 new_port) {
     new_port = port_normalize(new_port);
     if (!g_aud_open_fn || !g_aud_close_fn) return;
+
+    if (new_port == g_aud_actual_port && g_aud_handle >= 0) {
+        printf("audio: already on port %u (%s)\n",
+               (unsigned)new_port, game_audio_port_name(new_port));
+        game.audio_port = new_port;
+        return;
+    }
 
     printf("audio: restart -> port %u (%s)\n",
            (unsigned)new_port, game_audio_port_name(new_port));
 
     g_audio_pause = 1;
-    sleep_ms(60);
+    sleep_ms(80);
 
     s32 h_new = -1;
-    if (g_user_id > 0) h_new = try_open_audio_port(g_user_id, (s32)new_port);
-    if (h_new < 0) h_new = try_open_audio_port(0xFF, (s32)new_port);
+    for (int attempt = 0; attempt < 8 && h_new < 0; attempt++) {
+        if (g_user_id > 0) h_new = try_open_audio_port(g_user_id, (s32)new_port);
+        if (h_new < 0) h_new = try_open_audio_port(0xFF, (s32)new_port);
+        if (h_new < 0) {
+            printf("audio: retry %d for port %u (0x%08x)\n",
+                   attempt + 1, (unsigned)new_port, (unsigned)h_new);
+            sleep_ms(150);
+        }
+    }
 
     if (h_new < 0) {
-        printf("audio: port %u unavailable (0x%08x), staying on %u\n",
-               (unsigned)new_port, (unsigned)h_new,
-               (unsigned)g_aud_actual_port);
+        printf("audio: port %u unavailable after retries, staying on %u\n",
+               (unsigned)new_port, (unsigned)g_aud_actual_port);
         g_audio_pause = 0;
         return;
     }
@@ -504,6 +522,9 @@ static void audio_restart_with_port(u8 new_port) {
     game.audio_port   = new_port;
     printf("audio: switched to port %u, handle=%d\n",
            (unsigned)new_port, h_new);
+
+    sleep_ms(120);
+
     g_audio_pause = 0;
 }
 
@@ -560,7 +581,7 @@ static void reset_settings_to_default(void) {
     printf("reset: restoring defaults\n");
 
     game_set_diff(&game, DIFF_NORMAL);
-    game.is_night    = 0;
+    game.is_night     = 0;
     game.vibration_on = 1;
     game.sfx_volume   = 100;
     game.screen_mode  = SCREEN_FULL;
@@ -569,7 +590,7 @@ static void reset_settings_to_default(void) {
     haptic_apply_toggle();
 
     u8 target_port = PORT_TV;
-    if (game.audio_port != target_port) {
+    if (g_aud_actual_port != target_port || game.audio_port != target_port) {
         audio_restart_with_port(target_port);
     } else {
         game.audio_port = target_port;
