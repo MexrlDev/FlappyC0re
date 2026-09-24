@@ -11,7 +11,6 @@ static u32 checksum(const u32 *w, int n) {
     return x;
 }
 
-/* Try each path in order.  First one that opens read or write wins. */
 static const char *save_paths[] = {
     "/savedata0/.savegame/flappy.sav",
     "/av_contents/content_tmp/flappy.sav",
@@ -23,8 +22,6 @@ static const char *active_path = NULL;
 static int ready;
 
 int save_init(void) {
-    /* Make sure the parent directories exist.  mkdir on an existing path
-       returns an error but that is harmless. */
     mkdir("/savedata0", 0777);
     mkdir("/savedata0/.savegame", 0777);
     mkdir("/av_contents", 0777);
@@ -64,11 +61,13 @@ int save_load(struct game *g) {
     if (b.diff < DIFF_COUNT) game_set_diff(g, (enum diff)b.diff);
     g->is_night = b.is_night ? 1 : 0;
 
-    /* v1 saves did not have vibration_on; default to enabled */
-    if (b.version >= 2)
-        g->vibration_on = b.vibration_on ? 1 : 0;
+    if (b.version >= 2) g->vibration_on = b.vibration_on ? 1 : 0;
+    else                g->vibration_on = 1;
+
+    if (b.version >= 3 && b.screen_mode < SCREEN_MODE_COUNT)
+        g->screen_mode = (enum screen_mode)b.screen_mode;
     else
-        g->vibration_on = 1;
+        g->screen_mode = SCREEN_FULL;
 
     return 0;
 }
@@ -85,6 +84,7 @@ int save_write(const struct game *g) {
     b.diff           = (u32)g->diff;
     b.is_night       = g->is_night ? 1 : 0;
     b.vibration_on   = g->vibration_on ? 1 : 0;
+    b.screen_mode    = (u32)g->screen_mode;
     b.checksum       = checksum(&b.magic, 8);
 
     FILE *f = fopen(active_path, "w");
