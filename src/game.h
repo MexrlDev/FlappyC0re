@@ -58,6 +58,38 @@ struct game {
     u32   flash_until_ms;
 };
 
+/* ---- Reference-matched dimensions (matches PsVue JS port) ---- */
+#define GAME_SCALE_NUM 1080
+#define GAME_SCALE_DEN 512
+#define GAME_SCALE_F   (1080.0f / 512.0f)
+#define GAME_SCALE_FP  540                       /* 2.109375 * 256 */
+
+#define BG_W_ORIG   288
+#define BG_H_ORIG   512
+#define BG_W  ((BG_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 608 */
+#define BG_H  ((BG_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 1080 */
+
+#define BASE_W_ORIG 336
+#define BASE_H_ORIG 112
+#define BASE_W ((BASE_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 709 */
+#define BASE_H ((BASE_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 236 */
+#define GROUND_H BASE_H
+
+#define PIPE_W_ORIG 52
+#define PIPE_H_ORIG 320
+#define PIPE_W ((PIPE_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 110 */
+#define PIPE_H ((PIPE_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 675 */
+
+#define BIRD_W_ORIG 34
+#define BIRD_H_ORIG 24
+#define BIRD_W ((BIRD_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 72 */
+#define BIRD_H ((BIRD_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 51 */
+
+#define GAMEOVER_W ((192 * 3 + 1) / 2)   /* 288 */
+#define GAMEOVER_H ((42  * 3 + 1) / 2)   /*  63 */
+
+#define BIRD_X_POS 300.0f
+
 void   game_init(struct game *g);
 void   game_reset_run(struct game *g);
 void   game_start(struct game *g);
