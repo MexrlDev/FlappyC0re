@@ -33,7 +33,6 @@ PERSIST static void *g_aud_open_fn  = 0;
 PERSIST static void *g_aud_out_fn   = 0;
 PERSIST static void *g_aud_mod      = 0;
 
-/* Port actually opened, so the menu shows reality not wish */
 PERSIST static u8 g_aud_actual_port = 0;
 
 PERSIST static u32 g_pad_fails = 0;
@@ -283,7 +282,6 @@ static void present(void) {
 
 static int video_init(u64 eboot) {
     void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
-    printf("video: cancel=%p\n", (void*)cancel);
     if (cancel) {
         u64 gs   = *(u64*)(eboot + EBOOT_GS_THREAD);
         u64 spu2 = *(u64*)(eboot + EBOOT_IOP_SPU2);
@@ -383,21 +381,36 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
+/* Sweep only the handle ranges that our supported ports use:
+   TV      -> 0x2000_xxxx
+   HEADSET -> 0x2003_xxxx
+   Also BGM/VOICE prefixes so any earlier leak is cleaned up too.
+   Total: 4 prefixes * 0x40 slots = 256 iterations (~30 ms). */
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
     int released = 0;
-    /* Handles look like 0x20XX_00YY where XX is port-related.
-       Sweep the full 0x20000000..0x20FFFFFF namespace, restricted to
-       the low 16 bits, to catch anything leaked by prior sessions. */
-    for (u32 hi = 0; hi < 0x100; hi++) {
-        u64 base = 0x20000000ULL | ((u64)hi << 16);
-        for (u32 lo = 0; lo < 0x100; lo++) {
-            u64 guess = base | (u64)lo;
-            s32 r = (s32)NC(G, g_aud_close_fn, guess, 0,0,0,0,0);
+    static const u64 prefixes[] = {
+        0x20000000ULL,   /* TV       */
+        0x20010000ULL,   /* BGM      */
+        0x20020000ULL,   /* VOICE    */
+        0x20030000ULL,   /* HEADSET  */
+    };
+    for (int p = 0; p < 4; p++) {
+        for (u64 i = 1; i <= 0x40; i++) {
+            u64 h = prefixes[p] | i;
+            s32 r = (s32)NC(G, g_aud_close_fn, h, 0,0,0,0,0);
             if (r == 0) released++;
         }
     }
     return released;
+}
+
+/* Only TV (0) and HEADSET (3) are supported. */
+#define PORT_TV       0
+#define PORT_HEADSET  3
+
+static int port_is_valid(u8 p) {
+    return p == PORT_TV || p == PORT_HEADSET;
 }
 
 static void audio_init_from(void) {
@@ -421,33 +434,34 @@ static void audio_init_from(void) {
 
     int released = audio_sweep_stale_handles();
     printf("audio: released %d stale handles\n", released);
-    if (released > 0) sleep_ms(300);
+    if (released > 0) sleep_ms(150);
 
-    /* Fallback order.  HEADSET goes last because it always opens but
-       produces silence when no headset is connected. */
-    static const u8 fallback[7] = { 0, 2, 4, 1, 5, 6, 3 };
+    u8 preferred = game.audio_port;
+    if (!port_is_valid(preferred)) preferred = PORT_TV;
+
+    u8 other = (preferred == PORT_TV) ? PORT_HEADSET : PORT_TV;
 
     s32 h = -1;
-    u8  opened = 0;
+    u8  opened = preferred;
 
-    /* Try TV (port 0) first, unconditionally. */
-    s32 r0 = try_open_audio_port(g_user_id, 0);
-    if (r0 < 0) r0 = try_open_audio_port(0xFF, 0);
-    printf("audio: try port 0 (TV) -> %d (0x%08x)\n", r0, (unsigned)r0);
-    if (r0 >= 0) { h = r0; opened = 0; }
+    if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)preferred);
+    if (h < 0) h = try_open_audio_port(0xFF, (s32)preferred);
+    printf("audio: try port %u (%s) -> %d (0x%08x)\n",
+           (unsigned)preferred, game_audio_port_name(preferred),
+           h, (unsigned)h);
+    if (h >= 0) opened = preferred;
 
-    for (int i = 0; i < 7 && h < 0; i++) {
-        u8 p = fallback[i];
-        if (p == 0) continue;
-        s32 r = try_open_audio_port(g_user_id, (s32)p);
-        if (r < 0) r = try_open_audio_port(0xFF, (s32)p);
+    if (h < 0) {
+        if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)other);
+        if (h < 0) h = try_open_audio_port(0xFF, (s32)other);
         printf("audio: try port %u (%s) -> %d (0x%08x)\n",
-               (unsigned)p, game_audio_port_name(p), r, (unsigned)r);
-        if (r >= 0) { h = r; opened = p; }
+               (unsigned)other, game_audio_port_name(other),
+               h, (unsigned)h);
+        if (h >= 0) opened = other;
     }
 
     if (h < 0) {
-        printf("audio: ALL OPENS FAILED.\n");
+        printf("audio: NO AUDIO AVAILABLE.\n");
         return;
     }
 
@@ -462,7 +476,7 @@ static void audio_init_from(void) {
 }
 
 static void audio_restart_with_port(u8 new_port) {
-    if (new_port >= AUDIO_PORT_COUNT) new_port = 0;
+    if (!port_is_valid(new_port)) new_port = PORT_TV;
     if (!g_aud_open_fn || !g_aud_close_fn) return;
 
     printf("audio: restart -> port %u (%s)\n",
@@ -731,9 +745,8 @@ static void menu_update(u32 pressed) {
             audio_set_master(game.sfx_volume);
             save_write(&game);
         } else if (game.menu_cursor == 5) {
-            int p = (int)game.audio_port + dir;
-            p = (p + AUDIO_PORT_COUNT) % AUDIO_PORT_COUNT;
-            audio_restart_with_port((u8)p);
+            u8 next = (game.audio_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
+            audio_restart_with_port(next);
             save_write(&game);
         } else if (game.menu_cursor == 6) {
             int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
@@ -764,8 +777,8 @@ static void menu_update(u32 pressed) {
             save_write(&game);
             break;
         case 5: {
-            u8 p = (u8)((game.audio_port + 1) % AUDIO_PORT_COUNT);
-            audio_restart_with_port(p);
+            u8 next = (game.audio_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
+            audio_restart_with_port(next);
             save_write(&game);
             break;
         }
@@ -913,8 +926,7 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
 
     audio_shutdown();
     if (g_aud_close_fn && g_aud_handle >= 0) {
-        s32 r = (s32)NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
-        printf("cleanup: close handle %d -> %d\n", g_aud_handle, r);
+        NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
         g_aud_handle = -1;
     }
 
@@ -944,25 +956,25 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
-    g_exit_now      = 0;
-    g_audio_running = 1;
-    g_audio_pause   = 0;
-    g_audio_tid     = 0;
-    g_aud_handle    = -1;
-    g_aud_close_fn  = 0;
-    g_aud_open_fn   = 0;
-    g_aud_out_fn    = 0;
-    g_aud_mod       = 0;
+    g_exit_now        = 0;
+    g_audio_running   = 1;
+    g_audio_pause     = 0;
+    g_audio_tid       = 0;
+    g_aud_handle      = -1;
+    g_aud_close_fn    = 0;
+    g_aud_open_fn     = 0;
+    g_aud_out_fn      = 0;
+    g_aud_mod         = 0;
     g_aud_actual_port = 0;
-    g_pad_fails     = 0;
-    pad_prev        = 0;
-    haptic_until_ms = 0;
-    total_frames    = 0;
-    video_h         = -1;
-    fbs_mem         = 0;
-    eq              = 0;
-    g_last_lb       = 0xFFFFFFFFu;
-    last_gstate     = 0xFF;
+    g_pad_fails       = 0;
+    pad_prev          = 0;
+    haptic_until_ms   = 0;
+    total_frames      = 0;
+    video_h           = -1;
+    fbs_mem           = 0;
+    eq                = 0;
+    g_last_lb         = 0xFFFFFFFFu;
+    last_gstate       = 0xFF;
 
     int nreloc = apply_relocations();
 
@@ -1004,12 +1016,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game_init(&game);
     game.vibration_on = 1;
     game.sfx_volume   = 100;
-    game.audio_port   = 0;
+    game.audio_port   = PORT_TV;
     save_load(&game);
-    audio_set_master(game.sfx_volume);
 
-    /* Force TV (port 0) regardless of what the save said. */
-    game.audio_port = 0;
+    /* Only allow the two supported ports; anything else falls back to TV. */
+    if (!port_is_valid(game.audio_port)) game.audio_port = PORT_TV;
+
+    audio_set_master(game.sfx_volume);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "AUDIO\n", 6);
     audio_init_from();
