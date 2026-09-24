@@ -373,7 +373,8 @@ static void audio_init_from(void) {
     if (!a_open || !a_out) { printf("audio: syms missing\n"); return; }
     g_aud_close_fn = a_close;
 
-    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
+    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 2048, SAMPLE_RATE, AUDIO_S16_STEREO);
+    if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 512, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 256, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) { printf("audio: open failed %d\n", h); return; }
@@ -722,9 +723,10 @@ static void *audio_thread_entry(void *arg) {
     if (self_fn && setprio) {
         u64 self = NC(G, self_fn, 0,0,0,0,0,0);
         if (self) {
-            /* Lower number = higher priority on Sony's scheduler.  200 is
-               comfortably above background work but below kernel threads. */
-            NC(G, setprio, self, 200, 0, 0, 0, 0);
+            /* Lower number = higher priority on Sony's scheduler.
+               100 gives the audio thread comfortable headroom over the
+               renderer, eliminating underruns during heavy frames. */
+            NC(G, setprio, self, 100, 0, 0, 0, 0);
         }
     }
 
