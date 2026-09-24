@@ -40,7 +40,7 @@ const char *game_screen_name(enum screen_mode m) {
 const char *game_audio_port_name(u8 port) {
     switch (port) {
     case 2: return "TV";
-    case 3: return "HEADPHONE";
+    case 3: return "HEADSET";
     default: break;
     }
     return "TV";
