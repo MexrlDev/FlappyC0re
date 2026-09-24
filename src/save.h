@@ -1,10 +1,11 @@
+/* SPDX-License-Identifier: MIT */
 #ifndef SAVE_H
 #define SAVE_H
 #include "core.h"
 #include "game.h"
 
 #define SAVE_PATH "/savedata0/.savegame/flappy.sav"
-#define SAVE_VERSION 4
+#define SAVE_VERSION 5
 
 struct save_blob {
     u32 magic;
@@ -17,6 +18,7 @@ struct save_blob {
     u32 vibration_on;
     u32 screen_mode;
     u32 sfx_volume;
+    u32 audio_port;
     u32 checksum;
 };
 
