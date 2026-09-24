@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 #include "audio.h"
 
 extern const u8 asset_blob[];
@@ -7,7 +8,7 @@ extern const u8 asset_blob[];
 
 struct voice {
     const s16 *pcm;
-    u32 len;      /* frames */
+    u32 len;
     u32 pos;
     float vol;
     u8  active;
@@ -41,7 +42,7 @@ void audio_play(enum asset_id id, float vol) {
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!voices[i].active) {
             voices[i].pcm = (const s16*)(asset_blob + a->offset);
-            voices[i].len = a->h;      /* h holds num_frames for WAV */
+            voices[i].len = a->h;
             voices[i].pos = 0;
             voices[i].vol = vol;
             voices[i].active = 1;
@@ -67,19 +68,4 @@ void audio_mix_tick(void) {
         mix_buf[i*2+1] = (s16)acc;
     }
     NC(gadget, audio_out_fn, (u64)audio_handle, (u64)mix_buf, 0, 0, 0, 0);
-}
-
-static int thread_running = 1;
-
-static void *audio_thread(void *arg) {
-    (void)arg;
-    while (thread_running) audio_mix_tick();
-    return 0;
-}
-
-int audio_start_thread(void) {
-    void *pc = SYM(gadget, 0, 0, "scePthreadCreate");
-    (void)pc;
-    /* We don't have easy dlsym here; main.c will spawn us if available. */
-    return -1;
 }
