@@ -177,19 +177,17 @@ static void lightbar(u8 r, u8 g, u8 b) {
     NC(G, pad_lb_fn, (u64)pad_h, (u64)&col, 0,0,0,0);
 }
 
-static const u32 LB_MENU    = 0xFF8000u;   /* orange       */
-static const u32 LB_PLAYING = 0xFFFF00u;   /* bright yellow */
-static const u32 LB_DEAD    = 0xFF0000u;   /* red          */
-static const u32 LB_DEFAULT = 0x0000C8u;   /* Sony soft blue */
+static const u32 LB_MENU    = 0xFF8000u;
+static const u32 LB_PLAYING = 0xFFFF00u;
+static const u32 LB_DEAD    = 0xFF0000u;
+static const u32 LB_DEFAULT = 0x0000C8u;
 
 static void lightbar_apply(u32 rgb) {
     lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
-/* Rainbow colour: hue walk over a 6-segment cycle.
-   Call with a rising tick counter; returns R<<16 | G<<8 | B. */
 static u32 rainbow_color(u32 tick) {
-    u32 t = tick & 0x5FF;              /* 0..1535 */
+    u32 t = tick & 0x5FF;
     u32 r, g, b;
     if      (t < 256)  { r = 255;       g = t;          b = 0; }
     else if (t < 512)  { r = 511 - t;   g = 255;        b = 0; }
@@ -200,14 +198,10 @@ static u32 rainbow_color(u32 tick) {
     return (r << 16) | (g << 8) | b;
 }
 
-/* Only writes to the lightbar when the colour actually changes.
-   Called every frame from the main loop. */
 static u32 g_last_lb = 0xFFFFFFFFu;
 static void update_lightbar(void) {
     u32 desired;
     if (game.state == GS_PAUSED) {
-        /* Fast rainbow while paused.  16 units per frame × 30 fps ≈ 480
-           units/s → a full cycle in ~3.2 s. */
         desired = rainbow_color(total_frames * 16u);
     } else if (game.state == GS_GAMEOVER) {
         desired = LB_DEAD;
@@ -275,6 +269,10 @@ static void apply_screen_viewport(void) {
         break;
     case SCREEN_4_3:
         render_set_viewport(0.75f, 240, 135);
+        break;
+    case SCREEN_MODE_COUNT:
+    default:
+        render_set_viewport(1.0f, 0, 0);
         break;
     }
 }
@@ -480,7 +478,6 @@ static void draw_credits(void) {
     render_text_center(510, "ASSETS", 0xFF808080u, 4);
     render_text_center(560, "Samuel Custodio (MIT)", 0xFFD0D0D0u, 4);
 
-    /* Tribute line — light blue (sky blue) */
     render_text_center(730, "In memory of PsVue-Mod", 0xFF87CEEBu, 5);
 
     render_text_center(900, "X or O to return", 0xFFC0C0C0u, 4);
@@ -678,7 +675,6 @@ static void game_update_and_draw(u32 pressed, float dt) {
         last_gstate = game.state;
     }
 
-    /* Auto-pause on controller disconnect */
     if (game.state == GS_PLAYING && g_pad_fails > 45) {
         game.state = GS_PAUSED;
         printf("PAD disconnected -> auto-pause\n");
@@ -700,7 +696,6 @@ static void game_update_and_draw(u32 pressed, float dt) {
         game_update(&game, dt);
         if (pressed & DS_CROSS)   { game_jump(&game); haptic_low_pulse(); }
         if (pressed & DS_OPTIONS) {
-            /* Record current score before pausing so save-on-quit keeps it. */
             if (game.score > game.high_score) game.high_score = game.score;
             save_write(&game);
             game.state = GS_PAUSED;
@@ -747,9 +742,6 @@ static void audio_pump(void) { audio_mix_tick(); }
 static void *audio_thread_entry(void *arg) {
     (void)arg;
 
-    /* Push audio thread priority up so it survives a busy render frame.
-       On Sony's kernel the exact range is undocumented; passing a large
-       value is safest — an out-of-range value is simply clamped. */
     void *self_fn = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSelf");
     void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
     if (self_fn && setprio) {
@@ -939,12 +931,8 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         u32 pressed = raw & ~pad_prev;
         pad_prev = raw;
 
-        /* Update lightbar (rainbow while paused). */
         update_lightbar();
 
-        /* Clear the framebuffer to black so pillarbox bars stay clean
-           for letterboxed screen modes.  rep stosl handles 1920*1080
-           in well under a millisecond. */
         render_clear_full(0xFF000000);
         apply_screen_viewport();
 
