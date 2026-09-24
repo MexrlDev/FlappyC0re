@@ -3,13 +3,13 @@
 #include "render.h"
 #include "audio.h"
 
-#define GRAVITY      (0.5f * 60.0f)
-#define JUMP_FORCE   (-10.0f * 60.0f)
+#define GRAVITY      (0.5f * 60.0f * 60.0f)   /* 1800 px/sec^2  (was 30) */
+#define JUMP_FORCE   (-10.0f * 60.0f)         /* -600 px/sec               */
 
-#define BIRD_X        300.0f
-#define BIRD_W        34.0f * 6.0f
-#define BIRD_H        24.0f * 6.0f
-#define GROUND_H      (112.0f * (1080.0f / 512.0f))
+#define BIRD_X        BIRD_X_POS
+#define BIRD_W_F      ((float)BIRD_W)
+#define BIRD_H_F      ((float)BIRD_H)
+#define GROUND_H_F    ((float)GROUND_H)
 #define SCREEN_H_F    1080.0f
 
 #define MAX_RAMP_SPEED 12.0f
@@ -64,19 +64,25 @@ static struct pipe_pair *obtain(struct game *g) {
     return &g->pool[0];
 }
 
+/* Persistent LCG — advances every spawn so runs differ. */
+static u32 s_rng = 0x13579BDFu;
+static u32 rng_next(void) {
+    s_rng = s_rng * 1103515245u + 12345u;
+    return s_rng >> 16;
+}
+
 static void spawn_pipe(struct game *g) {
     float min_gap_y = g->pipe_gap;
-    float max_gap_y = SCREEN_H_F - GROUND_H - g->pipe_gap - 10.0f;
-    float t = (float)((g->lifetime_pipes * 1103515245u + 12345u) & 0x7FFFFFFFu)
-              / 2147483648.0f;
+    float max_gap_y = SCREEN_H_F - GROUND_H_F - g->pipe_gap - 10.0f;
+    float t = (float)(rng_next() & 0x7FFF) / 32768.0f;
     float gy = min_gap_y + t * (max_gap_y - min_gap_y);
 
     struct pipe_pair *p = obtain(g);
     p->active  = 1;
     p->passed  = 0;
-    p->x       = 1920.0f + 40.0f;
-    p->y_top   = gy - g->pipe_gap;
-    p->y_bot   = gy;
+    p->x       = 1920.0f;
+    p->y_top   = gy - g->pipe_gap;   /* bottom of top pipe / top of gap */
+    p->y_bot   = gy;                 /* top of bottom pipe               */
     g->active[g->active_count++] = p;
 }
 
@@ -96,6 +102,7 @@ void game_init(struct game *g) {
     g->last_score = 0;
     g->high_score = 0;
     g->lifetime_pipes = 0;
+    s_rng = 0x13579BDFu ^ (u32)(g->lifetime_pipes + 1);
 }
 
 void game_set_diff(struct game *g, enum diff d) {
@@ -105,7 +112,7 @@ void game_set_diff(struct game *g, enum diff d) {
 }
 
 void game_reset_run(struct game *g) {
-    g->bird_y = 540.0f;
+    g->bird_y = SCREEN_H_F / 2.0f;
     g->bird_vy = 0.0f;
     g->pipe_speed = game_diff_pipe_speed(g->diff);
     g->pipe_gap   = game_diff_pipe_gap(g->diff);
@@ -117,6 +124,7 @@ void game_reset_run(struct game *g) {
     for (int i = g->active_count - 1; i >= 0; i--)
         release(g, g->active[i]);
     g->active_count = 0;
+    s_rng = 0x13579BDFu ^ (u32)(g->lifetime_pipes + 1);
 }
 
 void game_start(struct game *g) {
@@ -147,7 +155,7 @@ static void update_pipes(struct game *g, float dt) {
         struct pipe_pair *p = g->active[i];
         p->x -= g->pipe_speed * 60.0f * dt;
 
-        if (!p->passed && p->x + 52.0f * 6.0f < BIRD_X) {
+        if (!p->passed && p->x + (float)PIPE_W < BIRD_X) {
             p->passed = 1;
             g->score++;
             g->lifetime_pipes++;
@@ -158,7 +166,7 @@ static void update_pipes(struct game *g, float dt) {
             audio_play(A_SFX_SCORE, 0.5f);
         }
 
-        if (p->x + 52.0f * 6.0f < -80.0f)
+        if (p->x + (float)PIPE_W < -80.0f)
             release(g, p);
     }
 
@@ -179,14 +187,14 @@ void game_update(struct game *g, float dt) {
         if (g->state == GS_PLAYING) {
             g->bird_vy += GRAVITY * dt;
         } else {
-            g->bird_vy = 0;
-            g->bird_y  = 540.0f + (float)((int)(g->base_scroll) % 40) - 20.0f;
+            g->bird_vy = 0.0f;
+            g->bird_y  = SCREEN_H_F / 2.0f;
         }
         g->bird_y += g->bird_vy * dt;
 
-        if (g->bird_y < 0) { g->bird_y = 0; g->bird_vy = 0; }
-        if (g->bird_y + BIRD_H > SCREEN_H_F - GROUND_H) {
-            g->bird_y = SCREEN_H_F - GROUND_H - BIRD_H;
+        if (g->bird_y < 0.0f) { g->bird_y = 0.0f; g->bird_vy = 0.0f; }
+        if (g->bird_y + BIRD_H_F > SCREEN_H_F - GROUND_H_F) {
+            g->bird_y = SCREEN_H_F - GROUND_H_F - BIRD_H_F;
             game_over(g);
             return;
         }
@@ -198,10 +206,12 @@ void game_update(struct game *g, float dt) {
         float bx = BIRD_X, by = g->bird_y;
         for (int i = 0; i < g->active_count; i++) {
             struct pipe_pair *p = g->active[i];
-            if (aabb(bx, by, BIRD_W, BIRD_H,
-                     p->x, p->y_top - 320.0f * 6.0f, 52.0f * 6.0f, 320.0f * 6.0f)
-             || aabb(bx, by, BIRD_W, BIRD_H,
-                     p->x, p->y_bot, 52.0f * 6.0f, 320.0f * 6.0f)) {
+            /* top pipe AABB: (x, y_top - PIPE_H) .. (x + PIPE_W, y_top)     */
+            if (aabb(bx, by, BIRD_W_F, BIRD_H_F,
+                     p->x, p->y_top - (float)PIPE_H, (float)PIPE_W, (float)PIPE_H)
+             || /* bottom pipe AABB: (x, y_bot) .. (x + PIPE_W, y_bot + PIPE_H) */
+                aabb(bx, by, BIRD_W_F, BIRD_H_F,
+                     p->x, p->y_bot, (float)PIPE_W, (float)PIPE_H)) {
                 game_over(g);
                 return;
             }
@@ -211,6 +221,6 @@ void game_update(struct game *g, float dt) {
     g->bg_scroll   -= (g->pipe_speed / 3.0f) * 60.0f * dt;
     g->base_scroll -= g->pipe_speed * 60.0f * dt;
 
-    if (g->bg_scroll < -288.0f * 6.0f) g->bg_scroll += 288.0f * 6.0f;
-    if (g->base_scroll < -336.0f * 6.0f) g->base_scroll += 336.0f * 6.0f;
+    if (g->bg_scroll   < -(float)BG_W)   g->bg_scroll   += (float)BG_W;
+    if (g->base_scroll < -(float)BASE_W) g->base_scroll += (float)BASE_W;
 }
