@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: MIT
 --[[
   flappy.lua -- LuaC0re payload for Flappy Bird PS5
 ]]
@@ -7,7 +8,6 @@ local LOG_PORT     = 9027
 local SC_PORT_BASE = 5001
 local SC_PORT_MAX  = 5020
 
--- Enable logging only if PC_IP is a real IPv4 address
 local HAVE_LOGS = (PC_IP:match("^%d+%.%d+%.%d+%.%d+$") ~= nil)
 
 init_dlsym()
@@ -41,6 +41,28 @@ local function ulog(m)
     end
 end
 ulog("flappy: starting")
+
+-- ---------- real user id ----------
+local userId = 0xFF   -- 0xFF = "any user", safe fallback
+do
+    local usr_mod = 0
+    if sceKernelLoadStartModule then
+        usr_mod = sceKernelLoadStartModule("libSceUserService.sprx", 0, 0, 0, 0, 0)
+    end
+    if usr_mod and usr_mod > 0 then
+        local get_uid = dlsym(usr_mod, "sceUserServiceGetInitialUser")
+        if get_uid then
+            local uid_buf = malloc(4)
+            write32(uid_buf, 0)
+            local ret = func_wrap(get_uid)(uid_buf)
+            if ret == 0 then
+                local v = read32(uid_buf)
+                if v > 0 then userId = v end
+            end
+        end
+    end
+end
+ulog("userId = " .. tostring(userId))
 
 -- ---------- memory ----------
 local SC_TARGET = 0x100000
@@ -119,6 +141,17 @@ if total < 0x20000 then
 end
 
 -- ---------- ext_args ----------
+-- Layout (matches struct ext_args_lua in main.c):
+--   0x00  u64 eboot
+--   0x08  u64 r0
+--   0x10  u32 frame
+--   0x14  u32 pad
+--   0x18  s32 log_fd
+--   0x1C  s32 pad2
+--   0x20  u8  log_sa[16]
+--   0x30  u64 tcp_srv
+--   0x38  u64 wad_port
+--   0x40  u64 user_id
 local ext = malloc(0x80)
 memset(ext, 0, 0x80)
 write64(ext + 0x00, 0xDEAD)
@@ -127,6 +160,7 @@ write32(ext + 0x1C, -1)
 if log_sa then
     for i = 0, 15 do write8(ext + 0x20 + i, read8(log_sa + i)) end
 end
+write64(ext + 0x40, userId)
 
 ulog("entering shellcode at 0x" .. string.format("%x", rx))
 func_wrap(rx)(EBOOT_BASE, SCE_KERNEL_DLSYM, ext)
