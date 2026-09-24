@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 #include "core.h"
 #include "ps_libc.h"
 #include "assets.h"
@@ -6,40 +7,22 @@
 #include "audio.h"
 #include "save.h"
 
-/* ps_libc needs its own declarations we didn't duplicate */
-void  ps_libc_init(void*, void*, void*, void*, void*, void*, void*, void*,
-                   void*, void*, s32, u8*);
-
-/* -------- platform state (persist so savedata keeps working after BSS wipe) */
-
-struct ext_args {
-    u64 eboot;      /* 0x00 */
-    u64 r0;         /* 0x08 */
-    u32 frame;      /* 0x10 */
-    u32 pad0;       /* 0x14 */
-    s32 log_fd;     /* 0x14 actually 0x18 -- aligned by 8? keep it simple */
-    /* NOTE: the Lua writes at fixed offsets; layout below must match */
-
-    /* we redefine cleanly: */
-    u64 _pad_align;
-    u64 handoff[8];
-};
-
-/* Simpler: define the layout the Lua actually uses */
 struct ext_args_lua {
-    u64 eboot;            /* 0x00 */
-    u64 r0;               /* 0x08 */
-    u32 frame;            /* 0x10 */
-    u32 pad;              /* 0x14 */
-    s32 log_fd;           /* 0x18 */
-    s32 pad2;             /* 0x1C */
-    u8  log_sa[16];       /* 0x20 */
-    u64 tcp_srv;          /* 0x30 - WAD TCP listener */
-    u64 wad_port;         /* 0x38 */
-    u64 user_id;          /* 0x40 */
+    u64 eboot;
+    u64 r0;
+    u32 frame;
+    u32 pad;
+    s32 log_fd;
+    s32 pad2;
+    u8  log_sa[16];
+    u64 tcp_srv;
+    u64 wad_port;
+    u64 user_id;
 };
 
 PERSIST static void *G, *D;
+
+/* ---------------- video ---------------- */
 
 PERSIST static s32 video_h = -1;
 PERSIST static void *vid_flip, *vid_open, *vid_close, *vid_reg, *vid_rate, *vid_evt;
@@ -50,14 +33,25 @@ PERSIST static u64 start_us;
 PERSIST static void *get_proc_time;
 PERSIST static u64 total_frames;
 
+/* ---------------- pad ---------------- */
+
 PERSIST static s32 pad_h = -1;
 PERSIST static void *pad_read_fn;
+PERSIST static void *pad_vib_fn;
+PERSIST static void *pad_lb_fn;
 PERSIST static u8 pad_buf[128];
 PERSIST static u32 pad_prev;
+PERSIST static u8 vib_data[8];
+PERSIST static u8 lb_data[4];
+
+/* ---------------- game ---------------- */
 
 PERSIST static struct game game;
 
-/* --------------------------------------------------------------------- */
+/* Haptic timer: while now_ms() < haptic_until, the motors stay at the
+   values set by the last haptic() call.  When it expires we drop to 0. */
+PERSIST static u32 haptic_until_ms;
+PERSIST static u8  haptic_large, haptic_small;
 
 static u32 now_ms(void) {
     if (!get_proc_time) return (u32)(total_frames * 1000 / 60);
@@ -98,6 +92,88 @@ static u32 pad_pressed(void) {
     return p;
 }
 
+/* ---------------- haptics ---------------- */
+
+static void haptic_raw(u8 large, u8 small) {
+    haptic_large = large;
+    haptic_small = small;
+    if (!game.vibration_on) {
+        /* Still remember the value so toggling ON picks it up, but
+           don't touch the hardware. */
+        if (pad_h >= 0 && pad_vib_fn) {
+            vib_data[0] = 0; vib_data[1] = 0;
+            for (int i = 2; i < 8; i++) vib_data[i] = 0;
+            NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+        }
+        return;
+    }
+    if (pad_h < 0 || !pad_vib_fn) return;
+    vib_data[0] = large;
+    vib_data[1] = small;
+    for (int i = 2; i < 8; i++) vib_data[i] = 0;
+    NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+}
+
+/* Low pulse on jump.  Short enough that rapid taps don't stack into
+   a continuous rumble. */
+static void haptic_low_pulse(void) {
+    haptic_raw(80, 80);
+    haptic_until_ms = now_ms() + 40;
+}
+
+/* Strong on death, held for a full second. */
+static void haptic_death(void) {
+    haptic_raw(255, 255);
+    haptic_until_ms = now_ms() + 1000;
+}
+
+/* Medium on restart-after-death.  Short. */
+static void haptic_restart(void) {
+    haptic_raw(128, 128);
+    haptic_until_ms = now_ms() + 200;
+}
+
+/* Called once per frame; drops the motors to 0 when the timer expires. */
+static void haptic_tick(void) {
+    if (haptic_until_ms && now_ms() >= haptic_until_ms) {
+        haptic_until_ms = 0;
+        haptic_raw(0, 0);
+    }
+}
+
+/* When the user toggles vibration OFF, silence the motors immediately. */
+static void haptic_apply_toggle(void) {
+    if (!game.vibration_on) {
+        haptic_until_ms = 0;
+        if (pad_h >= 0 && pad_vib_fn) {
+            vib_data[0] = 0; vib_data[1] = 0;
+            for (int i = 2; i < 8; i++) vib_data[i] = 0;
+            NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+        }
+    }
+}
+
+/* ---------------- lightbar ---------------- */
+
+static void lightbar(u8 r, u8 g, u8 b) {
+    if (pad_h < 0 || !pad_lb_fn) return;
+    lb_data[0] = r;
+    lb_data[1] = g;
+    lb_data[2] = b;
+    lb_data[3] = 0;
+    NC(G, pad_lb_fn, (u64)pad_h, (u64)lb_data, 0,0,0,0);
+}
+
+static const u32 LB_MENU     = 0x0000C8u;   /* (0, 0, 200) soft blue */
+static const u32 LB_PLAYING  = 0xFFDC00u;   /* (255, 220, 0) yellow  */
+static const u32 LB_DEAD     = 0xFF0000u;   /* (255, 0, 0) red       */
+
+static void lightbar_apply(u32 rgb) {
+    lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
+/* ---------------- video init ---------------- */
+
 static void present(void) {
     NC(G, vid_flip, (u64)video_h, (u64)(total_frames & 1), 1,
        (u64)total_frames, 0, 0);
@@ -109,12 +185,6 @@ static void present(void) {
     }
     total_frames++;
 }
-
-static void render_swap_cb(void) {
-    render_swap();
-}
-
-/* --------------------------------------------------------------------- */
 
 static int video_init(u64 eboot) {
     void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
@@ -174,6 +244,8 @@ static int video_init(u64 eboot) {
     return 0;
 }
 
+/* ---------------- audio + pad init ---------------- */
+
 static void audio_init_from(void) {
     s32 amod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
                        (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
@@ -194,27 +266,55 @@ static void pad_init_from(void) {
     void *p_init = SYM(G, D, pmod, "scePadInit");
     void *p_geth = SYM(G, D, pmod, "scePadGetHandle");
     pad_read_fn  = SYM(G, D, pmod, "scePadRead");
+    pad_vib_fn   = SYM(G, D, pmod, "scePadSetVibration");
+    pad_lb_fn    = SYM(G, D, pmod, "scePadSetLightBar");
+
     if (p_init) NC(G, p_init, 0,0,0,0,0,0);
     if (p_geth) pad_h = (s32)NC(G, p_geth, 1, 0, 0, 0, 0, 0);
+
+    /* zero both motors and set default lightbar immediately */
+    for (int i = 0; i < 8; i++) vib_data[i] = 0;
+    if (pad_h >= 0 && pad_vib_fn)
+        NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+    lightbar_apply(LB_MENU);
 }
 
-/* --------------------------------------------------------------------- */
-/*                            MENU UI                                    */
+/* ---------------- menu UI ---------------- */
 
 static const char *menu_items[] = {
     "START GAME",
     "DIFFICULTY",
     "BACKGROUND",
+    "VIBRATION",
     "RESET SCORE",
     "SAVE STATUS",
+    "CREDITS",
     "EXIT",
 };
-#define MENU_COUNT 6
+#define MENU_COUNT 8
+
+static void draw_credits(void) {
+    render_clear(0xFF0A0A0A);
+    render_text_center(60,  "CREDITS", 0xFFFFC030u, 10);
+
+    render_text_center(180, "PROGRAMMER", 0xFF808080u, 4);
+    render_text_center(240, "MexrlDev",    0xFFFFFFFFu, 6);
+
+    render_text_center(380, "SPECIAL THANKS", 0xFF808080u, 4);
+    render_text_center(440, "Egycnq  -  EmuC0re",  0xFFD0D0D0u, 4);
+    render_text_center(490, "Gezine  -  LuaC0re",  0xFFD0D0D0u, 4);
+
+    render_text_center(610, "ASSETS", 0xFF808080u, 4);
+    render_text_center(670, "Samuel Custodio (MIT)", 0xFFD0D0D0u, 4);
+
+    render_text_center(880, "X or O to return", 0xFFC0C0C0u, 4);
+}
 
 static void draw_menu(void) {
+    if (game.show_credits) { draw_credits(); return; }
+
     render_clear(0xFF0A0A0A);
 
-    /* two-tone title with shadow */
     render_text_center(80,  "FLAPPY BIRD", 0xFF000000u, 10);
     render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
     render_text_center(240, "PS5 PORT",     0xFF808080u, 4);
@@ -231,37 +331,58 @@ static void draw_menu(void) {
             snprintf(line, sizeof(line), "BACKGROUND: %s", game.is_night ? "NIGHT" : "DAY");
             text = line;
         } else if (i == 3) {
-            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            snprintf(line, sizeof(line), "VIBRATION: %s", game.vibration_on ? "ON" : "OFF");
             text = line;
         } else if (i == 4) {
+            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            text = line;
+        } else if (i == 5) {
             snprintf(line, sizeof(line), "SAVE: %s",
                      save_available() ? "OK" : "NO SAVEDATA");
             text = line;
         }
-        if (i == game.menu_cursor) {
-            render_text(160, base_y + i * 70 - 6, ">", col, 4);
-        }
-        render_text(240, base_y + i * 70, text, col, 4);
+        if (i == game.menu_cursor)
+            render_text(160, base_y + i * 60 - 6, ">", col, 4);
+        render_text(240, base_y + i * 60, text, col, 4);
     }
 
-    /* HUD */
     render_text(40, 940, "X: SELECT   O: BACK", 0xFF808080u, 3);
     render_text(SCR_W - 40 - render_text_width("EGYDEVTEAM", 3),
                 940, "EGYDEVTEAM", 0xFF606060u, 3);
 
     char hi[64];
-    snprintf(hi, sizeof(hi), "HIGH: %d   LIFETIME: %u", game.high_score, game.lifetime_pipes);
+    snprintf(hi, sizeof(hi), "HIGH: %d   LIFETIME: %u",
+             game.high_score, game.lifetime_pipes);
     render_text(40, 990, hi, 0xFF404040u, 3);
 }
 
-static void draw_ready(void) {
-    render_clear(0xFF000000);
-    render_blit_scaled(A_BG_DAY, 0, 0, 6.0f, 255);
-    render_blit_scaled(A_BASE,   0, 1080.0f - 236.0f, 6.0f, 255);
-    render_blit_scaled(A_BIRD_MID, 300.0f, 540.0f, 6.0f, 255);
-    render_text_center(280, "GET READY", 0xFFFFC030u, 10);
-    render_text_center(400, "X TO JUMP", 0xFFFFFFFFu, 4);
-    render_text_center(1080 - 340, "O TO GO BACK", 0xFF808080u, 3);
+static void draw_playing(void) {
+    int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
+    render_blit_scaled_bg(bg, game.bg_scroll - 1728.0f, 6.0f);
+    render_blit_scaled_bg(bg, game.bg_scroll, 6.0f);
+
+    for (int i = 0; i < game.active_count; i++) {
+        struct pipe_pair *p = game.active[i];
+        render_blit_scaled(A_PIPE_TOP, p->x, p->y_top - 320.0f * 6.0f, 6.0f, 255);
+        render_blit_scaled(A_PIPE_BOT, p->x, p->y_bot,               6.0f, 255);
+    }
+
+    int bw = 336 * 6;
+    int bx = ((int)game.base_scroll) % bw;
+    if (bx > 0) bx -= bw;
+    for (int x = bx; x < SCR_W; x += bw)
+        render_blit_scaled(A_BASE, (float)x, 1080.0f - 236.0f, 6.0f, 255);
+
+    int bird_asset = A_BIRD_MID;
+    if (game.bird_vy < -120.0f)      bird_asset = A_BIRD_UP;
+    else if (game.bird_vy > 120.0f)  bird_asset = A_BIRD_DOWN;
+    render_blit_scaled(bird_asset, 300.0f, game.bird_y, 6.0f, 255);
+
+    char s[32];
+    snprintf(s, sizeof(s), "SCORE: %d", game.score);
+    render_text(40, 40, s, 0xFFFFFFFFu, 5);
+    snprintf(s, sizeof(s), "BEST: %d", game.high_score);
+    render_text(40, 100, s, 0xFFFFC030u, 4);
 }
 
 static void draw_gameover(void) {
@@ -274,49 +395,27 @@ static void draw_gameover(void) {
     render_text_center(900, "X RESTART   O BACK", 0xFFC0C0C0u, 4);
 }
 
-static void draw_playing(void) {
-    /* Background: tiled */
-    int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
-    render_blit_scaled_bg(bg, game.bg_scroll - 1728.0f, 6.0f);
-    render_blit_scaled_bg(bg, game.bg_scroll, 6.0f);
-
-    /* pipes (scale 6) */
-    for (int i = 0; i < game.active_count; i++) {
-        struct pipe_pair *p = game.active[i];
-        render_blit_scaled(A_PIPE_TOP, p->x, p->y_top - 320.0f * 6.0f, 6.0f, 255);
-        render_blit_scaled(A_PIPE_BOT, p->x, p->y_bot,               6.0f, 255);
-    }
-
-    /* base strip */
-    int bw = 336 * 6;
-    int bx = ((int)game.base_scroll) % bw;
-    if (bx > 0) bx -= bw;
-    for (int x = bx; x < SCR_W; x += bw)
-        render_blit_scaled(A_BASE, (float)x, 1080.0f - 236.0f, 6.0f, 255);
-
-    /* bird sprite selection */
-    int bird_asset = A_BIRD_MID;
-    if (game.bird_vy < -120.0f)      bird_asset = A_BIRD_UP;
-    else if (game.bird_vy > 120.0f)  bird_asset = A_BIRD_DOWN;
-    render_blit_scaled(bird_asset, 300.0f, game.bird_y, 6.0f, 255);
-
-    /* HUD */
-    char s[32];
-    snprintf(s, sizeof(s), "SCORE: %d", game.score);
-    render_text(40, 40, s, 0xFFFFFFFFu, 5);
-    snprintf(s, sizeof(s), "BEST: %d", game.high_score);
-    render_text(40, 100, s, 0xFFFFC030u, 4);
+static void draw_ready(void) {
+    draw_playing();
+    render_text_center(280, "GET READY",   0xFFFFC030u, 10);
+    render_text_center(400, "X TO JUMP",   0xFFFFFFFFu, 4);
+    render_text_center(1080 - 340, "O TO GO BACK", 0xFF808080u, 3);
 }
 
-/* --------------------------------------------------------------------- */
+/* ---------------- menu logic ---------------- */
 
 static void menu_update(u32 pressed) {
+    if (game.show_credits) {
+        if (pressed & (DS_CROSS | DS_CIRCLE))
+            game.show_credits = 0;
+        return;
+    }
+
     if (pressed & DS_UP)
         game.menu_cursor = (game.menu_cursor + MENU_COUNT - 1) % MENU_COUNT;
     if (pressed & DS_DOWN)
         game.menu_cursor = (game.menu_cursor + 1) % MENU_COUNT;
 
-    /* LEFT/RIGHT adjust for rows that support it */
     if (pressed & (DS_LEFT | DS_RIGHT)) {
         int dir = (pressed & DS_RIGHT) ? 1 : -1;
         if (game.menu_cursor == 1) {
@@ -326,50 +425,78 @@ static void menu_update(u32 pressed) {
         } else if (game.menu_cursor == 2) {
             game.is_night ^= 1;
             save_write(&game);
+        } else if (game.menu_cursor == 3) {
+            game.vibration_on ^= 1;
+            haptic_apply_toggle();
+            save_write(&game);
         }
     }
 
     if (pressed & DS_CROSS) {
         switch (game.menu_cursor) {
         case 0: game_start(&game); break;
-        case 1: {
-            int d = (game.diff + 1) % DIFF_COUNT;
-            game_set_diff(&game, (enum diff)d);
+        case 1:
+            game_set_diff(&game, (enum diff)((game.diff + 1) % DIFF_COUNT));
             save_write(&game);
             break;
-        }
         case 2:
             game.is_night ^= 1;
             save_write(&game);
             break;
         case 3:
+            game.vibration_on ^= 1;
+            haptic_apply_toggle();
+            save_write(&game);
+            break;
+        case 4:
             game.high_score = 0;
             game.last_score = 0;
             save_write(&game);
             break;
-        case 4:
+        case 5:
             /* informational only */
             break;
-        case 5:
+        case 6:
+            game.show_credits = 1;
+            break;
+        case 7:
             save_write(&game);
+            haptic_raw(0, 0);
+            lightbar(0, 0, 200);   /* restore default soft blue */
             for (;;) sleep_ms(100);
         }
     }
 }
 
+/* ---------------- game loop body ---------------- */
+
+PERSIST static enum gstate last_gstate = 0xFF;
+
 static void game_update_and_draw(u32 pressed, float dt) {
+    /* Detect state transitions for haptics and lightbar */
+    if (game.state != last_gstate) {
+        if (game.state == GS_GAMEOVER) {
+            haptic_death();
+            lightbar_apply(LB_DEAD);
+        } else if (game.state == GS_MENU) {
+            lightbar_apply(LB_MENU);
+        } else {
+            lightbar_apply(LB_PLAYING);
+        }
+        last_gstate = game.state;
+    }
+
     if (game.state == GS_READY) {
         game_update(&game, dt);
-        if (pressed & DS_CROSS) game_jump(&game);
-        if (pressed & DS_CIRCLE) { game.state = GS_MENU; return; }
-        draw_playing();
-        render_text_center(280, "GET READY", 0xFFFFC030u, 10);
+        if (pressed & DS_CROSS) { game_jump(&game); haptic_low_pulse(); }
+        if (pressed & DS_CIRCLE) game.state = GS_MENU;
+        draw_ready();
         return;
     }
 
     if (game.state == GS_PLAYING) {
         game_update(&game, dt);
-        if (pressed & DS_CROSS) game_jump(&game);
+        if (pressed & DS_CROSS)   { game_jump(&game); haptic_low_pulse(); }
         if (pressed & DS_OPTIONS) game.state = GS_PAUSED;
         draw_playing();
         return;
@@ -380,8 +507,8 @@ static void game_update_and_draw(u32 pressed, float dt) {
         render_fill_rect(0, 0, SCR_W, SCR_H, 0x80000000u);
         render_text_center(480, "PAUSED", 0xFFFFFFFFu, 10);
         render_text_center(620, "X RESUME   O BACK", 0xFFC0C0C0u, 4);
-        if (pressed & DS_CROSS) game.state = GS_PLAYING;
-        if (pressed & DS_CIRCLE) { game.state = GS_MENU; }
+        if (pressed & DS_CROSS)  game.state = GS_PLAYING;
+        if (pressed & DS_CIRCLE) game.state = GS_MENU;
         return;
     }
 
@@ -389,17 +516,22 @@ static void game_update_and_draw(u32 pressed, float dt) {
         draw_playing();
         render_fill_rect(0, 0, SCR_W, SCR_H, 0xC0000000u);
         draw_gameover();
-        if (pressed & DS_CROSS) { save_write(&game); game_start(&game); }
-        if (pressed & DS_CIRCLE) { save_write(&game); game.state = GS_MENU; }
+        if (pressed & DS_CROSS) {
+            save_write(&game);
+            haptic_restart();
+            game_start(&game);
+        }
+        if (pressed & DS_CIRCLE) {
+            save_write(&game);
+            game.state = GS_MENU;
+        }
         return;
     }
 }
 
-/* --------------------------------------------------------------------- */
+/* ---------------- audio pump ---------------- */
 
-static void audio_pump(void) {
-    audio_mix_tick();
-}
+static void audio_pump(void) { audio_mix_tick(); }
 
 static void *audio_thread_entry(void *arg) {
     (void)arg;
@@ -407,14 +539,13 @@ static void *audio_thread_entry(void *arg) {
     return 0;
 }
 
-/* --------------------------------------------------------------------- */
+/* ---------------- entry point ---------------- */
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     G = (void*)(eboot + GADGET_OFFSET);
     D = dlsym;
 
-    /* Video hijack first: cancels GS thread and closes emulator handle */
     if (video_init(eboot) != 0) {
         for (;;) sleep_ms(1000);
     }
@@ -437,12 +568,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     save_init();
     game_init(&game);
+    game.vibration_on = 1;
     save_load(&game);
 
-    printf("FlappyBird: video_h=%d pad=%d save=%d\n",
-           video_h, pad_h, save_available());
+    printf("FlappyBird: video_h=%d pad=%d vib=%d lb=%d save=%d vib_on=%d\n",
+           video_h, pad_h, pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
+           save_available(), game.vibration_on);
 
-    /* spawn audio thread if pthread_create is available */
     void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
     if (pc) {
         u64 tid = 0;
@@ -450,7 +582,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
            (u64)(void*)audio_thread_entry, 0, (u64)"flap_aud", 0);
     }
 
-    /* Ensure first read has no false press */
     pad_prev = read_pad();
 
     u32 last_ms = now_ms();
@@ -463,6 +594,8 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         float dt = (float)dt_ms / 1000.0f;
         if (dt <= 0.0f) dt = 1.0f / 60.0f;
 
+        haptic_tick();
+
         u32 pressed = pad_pressed();
 
         if (game.state == GS_MENU) {
@@ -473,6 +606,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         }
 
         present();
-        if (!pc) audio_pump();   /* fallback if thread wasn't spawned */
+        if (!pc) audio_pump();
     }
 }
