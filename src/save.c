@@ -2,7 +2,7 @@
 #include "save.h"
 #include "ps_libc.h"
 
-#define MAGIC 0x59504C46u   /* "FLPY" */
+#define MAGIC 0x59504C46u
 
 static u32 checksum(const u32 *w, int n) {
     u32 x = 0x9E3779B9u;
@@ -69,6 +69,11 @@ int save_load(struct game *g) {
     else
         g->screen_mode = SCREEN_FULL;
 
+    if (b.version >= 4)
+        g->sfx_volume = (b.sfx_volume <= 100) ? (u8)b.sfx_volume : 100;
+    else
+        g->sfx_volume = 100;
+
     return 0;
 }
 
@@ -85,6 +90,7 @@ int save_write(const struct game *g) {
     b.is_night       = g->is_night ? 1 : 0;
     b.vibration_on   = g->vibration_on ? 1 : 0;
     b.screen_mode    = (u32)g->screen_mode;
+    b.sfx_volume     = (u32)g->sfx_volume;
     b.checksum       = checksum(&b.magic, 8);
 
     FILE *f = fopen(active_path, "w");
