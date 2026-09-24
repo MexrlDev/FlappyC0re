@@ -49,13 +49,23 @@ jobs:
           echo "---- baked files ----"
           ls -lh src/font_aa.bin src/font_aa_metrics.h
 
+      - name: Bake asset table
+        run: |
+          # Generates src/assets.h, src/assets.bin and (optionally)
+          # src/assets.S from the raw PNG/WAV files in assets/.
+          python3 tools/bake_assets.py
+          echo "---- generated headers ----"
+          ls -lh src/assets.h 2>/dev/null || true
+          ls -lh src/assets.bin 2>/dev/null || true
+          ls -lh src/assets.S 2>/dev/null || true
+
       - name: Clean before build
         run: |
           rm -rf build
           rm -f flappy.elf flappy.bin flappy.hex
-          rm -f src/assets.h src/assets.bin src/assets.S src/.assets.stamp
-          # NOTE: do NOT delete src/font_aa.bin or src/font_aa_metrics.h
-          # here — they were just produced by the previous step.
+          # NOTE: do NOT delete src/assets.h/.bin/.S or src/font_aa.* —
+          # those were produced by the two bake steps above and are
+          # needed for compilation.
 
       - name: Build
         run: |
@@ -91,13 +101,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload baked font (optional)
+      - name: Upload baked font + asset header (optional)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: FlappyC0re-font
+          name: FlappyC0re-generated
           path: |
             src/font_aa.bin
             src/font_aa_metrics.h
+            src/assets.h
+            src/assets.bin
           if-no-files-found: warn
           retention-days: 30
