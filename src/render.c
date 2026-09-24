@@ -1,5 +1,5 @@
 #include "render.h"
-#include "font.h"
+#include "font_aa.h"
 #include "assets.h"
 
 extern const u8 asset_blob[];
@@ -223,41 +223,17 @@ void render_blit_scaled_bg_fp(int id, float xf, int scale_fp) {
     }
 }
 
+/* ---- Text: anti-aliased TTF atlas ---- */
+
 void render_text(int x, int y, const char *s, u32 c, int scale) {
-    while (*s) {
-        unsigned char ch = (unsigned char)*s++;
-        if (ch >= 'a' && ch <= 'z') ch -= 32;
-        if (ch < 32 || ch > 127) ch = '?';
-        const u8 *g = ps_font8x8[ch - 32];
-        for (int r = 0; r < 8; r++) {
-            u8 bits = g[r];
-            if (!bits) continue;
-            for (int b = 0; b < 8; b++) {
-                if (!(bits & (0x80 >> b))) continue;
-                int bx = x + b * scale;
-                int by = y + r * scale;
-                for (int ty = 0; ty < scale; ty++) {
-                    int py = by + ty;
-                    if (py < 0 || py >= SCR_H) continue;
-                    u32 *row = cur + py * SCR_W;
-                    for (int tx = 0; tx < scale; tx++) {
-                        int px = bx + tx;
-                        if (px < 0 || px >= SCR_W) continue;
-                        row[px] = c;
-                    }
-                }
-            }
-        }
-        x += 8 * scale;
-    }
+    font_aa_draw(cur, x, y, s, c, scale * 8);
 }
 
 int render_text_width(const char *s, int scale) {
-    int n = 0; while (s[n]) n++;
-    return n * 8 * scale;
+    return font_aa_width(s, scale * 8);
 }
 
 void render_text_center(int y, const char *s, u32 c, int scale) {
-    int w = render_text_width(s, scale);
-    render_text((SCR_W - w) / 2, y, s, c, scale);
+    int w = font_aa_width(s, scale * 8);
+    font_aa_draw(cur, (SCR_W - w) / 2, y, s, c, scale * 8);
 }
