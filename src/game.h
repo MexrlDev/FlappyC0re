@@ -38,39 +38,34 @@ struct game {
     enum diff        diff;
     enum screen_mode screen_mode;
 
-    /* physics */
     float bird_y, bird_vy;
     float pipe_speed;
     float pipe_gap;
     float pipe_spawn_acc;
     float pipe_step;
 
-    /* scoring */
     int   score, last_score, high_score;
     u32   lifetime_pipes;
 
-    /* background */
     u8    is_night;
     float bg_scroll, base_scroll;
 
-    /* pipe pool */
     struct pipe_pair pool[POOL_PAIRS];
     struct pipe_pair *active[POOL_PAIRS];
     int   active_count;
 
-    /* menu */
     int   menu_cursor;
     u8    vibration_on;
+    u8    sfx_volume;      /* 0 = OFF, 1..99 partial, 100 = ON */
     u8    show_credits;
 
     u32   flash_until_ms;
 };
 
-/* ---- Reference-matched dimensions (matches PsVue JS port) ---- */
 #define GAME_SCALE_NUM 1080
 #define GAME_SCALE_DEN 512
 #define GAME_SCALE_F   (1080.0f / 512.0f)
-#define GAME_SCALE_FP  540                       /* 2.109375 * 256 */
+#define GAME_SCALE_FP  540
 
 #define BG_W_ORIG   288
 #define BG_H_ORIG   512
@@ -93,8 +88,8 @@ struct game {
 #define BIRD_W ((BIRD_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
 #define BIRD_H ((BIRD_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
 
-#define GAMEOVER_W ((192 * 3 + 1) / 2)   /* 288 */
-#define GAMEOVER_H ((42  * 3 + 1) / 2)   /*  63 */
+#define GAMEOVER_W ((192 * 3 + 1) / 2)
+#define GAMEOVER_H ((42  * 3 + 1) / 2)
 
 #define BIRD_X_POS 300.0f
 
@@ -108,7 +103,6 @@ void   game_set_diff(struct game *g, enum diff d);
 float  game_diff_pipe_speed(enum diff d);
 float  game_diff_pipe_gap(enum diff d);
 const char *game_diff_name(enum diff d);
-
 const char *game_screen_name(enum screen_mode m);
 
 #endif
