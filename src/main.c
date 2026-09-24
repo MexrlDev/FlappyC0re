@@ -35,6 +35,7 @@ PERSIST static void *g_aud_mod      = 0;
 
 PERSIST static u32 g_audio_next_try = 0;
 PERSIST static u32 g_audio_last_log = 0;
+PERSIST static int g_audio_attempts = 0;
 
 PERSIST static s32 g_pad_mod = -1;
 PERSIST static u32 g_pad_fails = 0;
@@ -383,11 +384,10 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-/* Port types tried in order.  VOICE and PERSONAL are the two the OS
-   routes userland audio into; MAIN and BGM sometimes open if the system
-   daemon has released them; PADSPK is a last resort. */
-static const s32 kPortOrder[] = { 2, 3, 0, 1, 4 };
-#define N_PORTS ((int)(sizeof(kPortOrder) / sizeof(kPortOrder[0])))
+/* VOICE (2) is the only port that reliably routes to the current
+   OS-selected output on retail firmware.  PERSONAL (3) opens but
+   produces silence on many firmwares, so we refuse it. */
+#define PORT_VOICE 2
 
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
@@ -408,19 +408,11 @@ static int audio_sweep_stale_handles(void) {
     return released;
 }
 
-/* Try each port in order.  Returns handle or -1. */
-static s32 audio_try_all_ports(int *opened_type) {
-    for (int i = 0; i < N_PORTS; i++) {
-        s32 p = kPortOrder[i];
-        s32 h = -1;
-        if (g_user_id > 0) h = try_open_audio_port(g_user_id, p);
-        if (h < 0) h = try_open_audio_port(0xFF, p);
-        if (h >= 0) {
-            if (opened_type) *opened_type = p;
-            return h;
-        }
-    }
-    return -1;
+static s32 audio_try_voice(void) {
+    s32 h = -1;
+    if (g_user_id > 0) h = try_open_audio_port(g_user_id, PORT_VOICE);
+    if (h < 0) h = try_open_audio_port(0xFF, PORT_VOICE);
+    return h;
 }
 
 static void audio_init_from(void) {
@@ -444,30 +436,39 @@ static void audio_init_from(void) {
 
     int released = audio_sweep_stale_handles();
     printf("audio: released %d stale handles\n", released);
-    if (released > 0) sleep_ms(800);
+    if (released > 0) sleep_ms(1500);
 
-    /* Try every port.  Retry the full cycle a couple of times in case
-       the kernel is still releasing from a previous session. */
-    int opened_type = -1;
+    /* Give VOICE up to ~8 seconds at startup (kernel releases prior
+       sessions within a couple of seconds).  We only ever accept
+       port 2 - if it stays blocked, we let the background retry
+       keep trying rather than falling back to a silent port. */
     s32 h = -1;
-    for (int attempt = 0; attempt < 3 && h < 0; attempt++) {
-        h = audio_try_all_ports(&opened_type);
-        if (h < 0 && attempt < 2) sleep_ms(400);
+    u32 deadline = now_ms() + 8000;
+    int attempt = 0;
+    while (now_ms() < deadline && h < 0) {
+        h = audio_try_voice();
+        if (h < 0) {
+            if ((attempt & 3) == 0) {
+                printf("audio: VOICE busy (0x%08x), waiting...\n",
+                       (unsigned)h);
+            }
+            sleep_ms(250);
+            attempt++;
+        }
     }
 
     if (h < 0) {
-        printf("audio: no port yet, will retry in background\n");
+        printf("audio: VOICE unavailable, retrying in background\n");
         g_audio_next_try = now_ms() + 1000;
         return;
     }
 
-    printf("audio: handle=%d (port %d)\n", h, opened_type);
+    printf("audio: handle=%d (VOICE)\n", h);
     g_aud_handle = h;
     audio_init(h, g_aud_out_fn, G);
 }
 
-/* Background recovery: if no handle, cycle through all ports every
-   second until one opens.  Never stops trying. */
+/* Background retry.  Only tries port 2.  Never gives up. */
 static void audio_tick(void) {
     if (g_aud_handle >= 0) return;
 
@@ -475,15 +476,20 @@ static void audio_tick(void) {
     if (now < g_audio_next_try) return;
     g_audio_next_try = now + 1500;
 
-    int opened_type = -1;
-    s32 h = audio_try_all_ports(&opened_type);
+    s32 h = audio_try_voice();
+    g_audio_attempts++;
+
     if (h >= 0) {
-        printf("audio: recovered (handle %d, port %d)\n", h, opened_type);
+        printf("audio: recovered (handle %d)\n", h);
         g_aud_handle = h;
         audio_init(h, g_aud_out_fn, G);
+        g_audio_attempts = 0;
     } else if (now - g_audio_last_log > 5000) {
         g_audio_last_log = now;
-        printf("audio: still no port\n");
+        printf("audio: waiting for VOICE (attempt %d, 0x%08x)\n",
+               g_audio_attempts, (unsigned)h);
+        /* Sweep again in case a leaked handle is in our range. */
+        audio_sweep_stale_handles();
     }
 }
 
@@ -967,6 +973,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_mod           = 0;
     g_audio_next_try    = 0;
     g_audio_last_log    = 0;
+    g_audio_attempts    = 0;
     g_pad_mod           = -1;
     g_pad_fails         = 0;
     pad_prev            = 0;
@@ -1018,7 +1025,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game_init(&game);
     game.vibration_on = 1;
     game.sfx_volume   = 100;
-    game.audio_port   = 2;
+    game.audio_port   = PORT_VOICE;
     save_load(&game);
 
     audio_set_master(game.sfx_volume);
