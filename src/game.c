@@ -37,6 +37,20 @@ const char *game_screen_name(enum screen_mode m) {
     return "?";
 }
 
+const char *game_audio_port_name(u8 port) {
+    switch (port) {
+    case 0: return "TV";
+    case 1: return "BGM";
+    case 2: return "VOICE";
+    case 3: return "HEADSET";
+    case 4: return "CONTROLLER";
+    case 5: return "AUX";
+    case 6: return "ALT";
+    default: break;
+    }
+    return "TV";
+}
+
 float game_diff_pipe_speed(enum diff d) {
     switch (d) {
     case DIFF_EASY:   return 4.0f;
@@ -110,6 +124,7 @@ void game_init(struct game *g) {
     g->show_credits = 0;
     g->vibration_on = 1;
     g->sfx_volume   = 100;
+    g->audio_port   = 0;
     game_set_diff(g, DIFF_NORMAL);
     g->is_night = 0;
     g->score = 0;
@@ -169,10 +184,6 @@ static void update_pipes(struct game *g, float dt) {
         struct pipe_pair *p = g->active[i];
         p->x -= g->pipe_speed * 60.0f * dt;
 
-        /* Score trigger on ENTRY: the pipe's left edge has reached the
-           bird's right edge.  Previously this fired on exit (pipe right
-           edge past bird left edge), which played the sound after the
-           bird was already out the other side. */
         if (!p->passed && p->x < BIRD_X + BIRD_W_F) {
             p->passed = 1;
             g->score++;
