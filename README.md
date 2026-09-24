@@ -2,24 +2,40 @@
 * [The Big One!](https://youtu.be/VHOCPpjUtD8?si=mlzagng2nm-eBmUX)
 
 ---
+## Readme
+- Require USB for saving (optional)
+- Headphones can be used to switch audio to it automatically
+- You can exit the payload then resend it and enter the game normally with all your save options and score still saved because the game is deigned to handle it.
+
+---
 ## Controls
 
 | Button | Function |
 | ------ | -------- |
 | Cross (X) | Jump (In Game) Select/Resume (Menu/Pause) |
 | Circle (O) | Back (In Game Start Only) Back (Menu/Pause) |
-| D-Pad | Navigation (menu) |
+| D-Pad | Navigation (menu) / Left Right for SFX to turn volume down and up by 5% each |
 | Options button | Pause/Resume (In Game) |
 
 ---
-## Added Options
-SFX - to lower/higher volume 
-!! AUTO SWIPE AUDIO WHEN HEADPHONE PLUGGED !!
+## Menu Options
+START GAME
+DIFFICULTY: EASY / NORMAL / HARD / RACER
+BACKGROUND: DAY / NIGHT
+VIBRATION: ON / OFF
+SFX: ON / 95% / 90% ... 5% / OFF
+SCREEN: FULL / 16:9 / 4:3
+RESET SCORE (current high score shown)
+SAVE: OK / NO SAVEDATA
+RESET SETTINGS
+CREDITS
+EXIT
 
 ---
 ## Setup
 1. Get the release zip, or copy the lua/py from the source code from this repo
-2. In Pythonica/PyCode for mobile go to SetUp for mobile
+2. Make sure to edit the python to add your PlayStation or luac0re IP address so payload gets send
+2.1 In Pythonica/PyCode for mobile go to SetUp for mobile
 3. for pc just start it via going to Python and starting it via shellcode Python3 flappy_launcher.py
 
 ---
