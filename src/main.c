@@ -31,8 +31,6 @@ PERSIST static void *g_aud_close_fn = 0;
 
 PERSIST static u32 g_pad_fails = 0;
 
-/* ---------------- early diagnostic ---------------- */
-
 static void early_send(u64 eboot, void *dlsym, s32 log_fd,
                        const u8 *log_sa, const char *msg, int msg_len)
 {
@@ -72,8 +70,6 @@ static void early_send_hexnum(u64 eboot, void *dlsym, s32 log_fd,
     early_send(eboot, dlsym, log_fd, log_sa, buf, p);
 }
 
-/* ---------------- ELF relocations ---------------- */
-
 typedef struct {
     u64 r_offset;
     u64 r_info;
@@ -107,8 +103,6 @@ static int apply_relocations(void) {
     return count;
 }
 
-/* ---------------- video ---------------- */
-
 PERSIST static s32 video_h = -1;
 PERSIST static void *vid_flip, *vid_open, *vid_close, *vid_reg, *vid_rate, *vid_evt;
 PERSIST static u64 eq;
@@ -118,8 +112,6 @@ PERSIST static u64 start_us;
 PERSIST static void *get_proc_time;
 PERSIST static u64 total_frames;
 
-/* ---------------- pad ---------------- */
-
 PERSIST static s32 pad_h = -1;
 PERSIST static void *pad_read_fn;
 PERSIST static void *pad_vib_fn;
@@ -127,8 +119,6 @@ PERSIST static void *pad_lb_fn;
 PERSIST static u8 pad_buf[128];
 PERSIST static u32 pad_prev;
 PERSIST static u8 vib_data[8];
-
-/* ---------------- game ---------------- */
 
 PERSIST static struct game game;
 
@@ -167,8 +157,6 @@ static u32 read_pad(void) {
     g_pad_fails = 0;
     return raw & 0x001FFFFFu;
 }
-
-/* ---------------- lightbar ---------------- */
 
 static void lightbar(u8 r, u8 g, u8 b) {
     if (pad_h < 0 || !pad_lb_fn) return;
@@ -215,8 +203,6 @@ static void update_lightbar(void) {
     lightbar_apply(desired);
 }
 
-/* ---------------- haptics ---------------- */
-
 static void haptic_raw(u8 large, u8 small) {
     haptic_large = large;
     haptic_small = small;
@@ -256,8 +242,6 @@ static void haptic_apply_toggle(void) {
         }
     }
 }
-
-/* ---------------- present / video init ---------------- */
 
 static void apply_screen_viewport(void) {
     switch (game.screen_mode) {
@@ -351,8 +335,6 @@ static int video_init(u64 eboot) {
     render_swap();
     return 0;
 }
-
-/* ---------------- user id + audio + pad init ---------------- */
 
 static void query_real_user_id(void) {
     void *load_mod = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLoadStartModule");
@@ -448,8 +430,6 @@ static void pad_init_from(void) {
     printf("lightbar set to orange (pad_h=%d lb=%p)\n",
            pad_h, (void*)pad_lb_fn);
 }
-
-/* ---------------- menu UI ---------------- */
 
 static const char *menu_items[] = {
     "START GAME",
@@ -590,8 +570,6 @@ static void draw_ready(void) {
     render_text_center(1080 - 340, "O TO GO BACK", 0xFF808080u, 3);
 }
 
-/* ---------------- menu logic ---------------- */
-
 static void menu_update(u32 pressed) {
     if (game.show_credits) {
         if (pressed & (DS_CROSS | DS_CIRCLE))
@@ -663,8 +641,6 @@ static void menu_update(u32 pressed) {
     }
 }
 
-/* ---------------- game loop body ---------------- */
-
 PERSIST static enum gstate last_gstate = 0xFF;
 
 static void game_update_and_draw(u32 pressed, float dt) {
@@ -710,7 +686,8 @@ static void game_update_and_draw(u32 pressed, float dt) {
         render_fill_rect(0, 0, SCR_W, SCR_H, 0x80000000u);
         render_text_center(480, "PAUSED", 0xFFFFFFFFu, 10);
         render_text_center(620, "X RESUME   O BACK", 0xFFC0C0C0u, 4);
-        if (pressed & DS_CROSS)  game.state = GS_PLAYING;
+        if (pressed & DS_CROSS)   game.state = GS_PLAYING;
+        if (pressed & DS_OPTIONS) game.state = GS_PLAYING;
         if (pressed & DS_CIRCLE) {
             save_write(&game);
             game.state = GS_MENU;
@@ -735,8 +712,6 @@ static void game_update_and_draw(u32 pressed, float dt) {
     }
 }
 
-/* ---------------- audio pump ---------------- */
-
 static void audio_pump(void) { audio_mix_tick(); }
 
 static void *audio_thread_entry(void *arg) {
@@ -746,14 +721,16 @@ static void *audio_thread_entry(void *arg) {
     void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
     if (self_fn && setprio) {
         u64 self = NC(G, self_fn, 0,0,0,0,0,0);
-        if (self) NC(G, setprio, self, 700, 0, 0, 0, 0);
+        if (self) {
+            /* Lower number = higher priority on Sony's scheduler.  200 is
+               comfortably above background work but below kernel threads. */
+            NC(G, setprio, self, 200, 0, 0, 0, 0);
+        }
     }
 
     while (g_audio_running) audio_pump();
     return 0;
 }
-
-/* ---------------- cleanup ---------------- */
 
 static void cleanup_and_return(struct ext_args_lua *ext) {
     g_audio_running = 0;
@@ -804,8 +781,6 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
     ext->step   = 99;
     ext->frame  = (u32)total_frames;
 }
-
-/* ---------------- entry point ---------------- */
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
@@ -886,8 +861,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
     if (pc) {
-        NC(G, pc, (u64)&g_audio_tid, 0,
-           (u64)(void*)audio_thread_entry, 0, (u64)"flap_aud", 0);
+        s32 pret = (s32)NC(G, pc, (u64)&g_audio_tid, 0,
+                           (u64)(void*)audio_thread_entry, 0,
+                           (u64)"flap_aud", 0);
+        printf("audio thread: ret=%d tid=0x%llx\n",
+               pret, (unsigned long long)g_audio_tid);
+    } else {
+        printf("audio thread: scePthreadCreate missing\n");
     }
 
     pad_prev = read_pad();
