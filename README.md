@@ -57,7 +57,7 @@ EXIT
 2.1 In Pythonica/PyCode for mobile go to [SetUp for mobile](https://github.com/MexrlDev/repo/tree/main/Mobile-Python-Tools#how-to-setup-the-scripts-in-this-folder)
 3. for pc just start it via going to Python and starting it via shellcode Python3 flappy_launcher.py
 
-Optional: You can turn on debugging logs via Python switch debug_logs from false to true 
+Optional: You can turn on debugging logs via Python switch DEBUGLOG from false to true 
 
 ---
 ## How to build it
