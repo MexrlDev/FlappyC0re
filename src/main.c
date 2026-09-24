@@ -394,14 +394,14 @@ static void audio_init_from(void) {
         { 0xFF,      0 },
         { g_user_id, 1 },
         { 0xFF,      1 },
+        { g_user_id, 2 },
+        { 0xFF,      2 },
         { g_user_id, 4 },
         { 0xFF,      4 },
         { g_user_id, 5 },
         { 0xFF,      5 },
         { g_user_id, 3 },
         { 0xFF,      3 },
-        { g_user_id, 2 },
-        { 0xFF,      2 },
     };
 
     s32 h = -1;
