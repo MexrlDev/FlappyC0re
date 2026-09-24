@@ -25,8 +25,7 @@ PERSIST static void *G, *D;
 /* ---------------- early diagnostic ---------------- */
 
 /* Sends a UDP datagram using only the stack and the dlsym pointer.
-   Does not touch any global variable, so it works before the
-   relocation pass has run. */
+   Does NOT touch any global.  Safe to call before relocations run. */
 static void early_send(u64 eboot, void *dlsym, s32 log_fd,
                        const u8 *log_sa, const char *msg, int msg_len)
 {
@@ -609,10 +608,10 @@ static void *audio_thread_entry(void *arg) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
-    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "ENTRY\n", 6);
-
+    /* Relocations FIRST — every global pointer below depends on them. */
     int nreloc = apply_relocations();
 
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "ENTRY\n", 6);
     early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
                       "RELOC ", (u64)nreloc);
 
