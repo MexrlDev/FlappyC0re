@@ -8,5 +8,7 @@ int  audio_init(s32 handle, void *aud_out_fn, void *G);
 void audio_shutdown(void);
 void audio_play(enum asset_id id, float vol);
 void audio_mix_tick(void);
+void audio_set_master(u8 v);
+int  audio_is_active(void);
 
 #endif
