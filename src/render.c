@@ -9,7 +9,6 @@ static u32 *fbs[2];
 static u32 *cur;
 static int   active;
 
-/* ---- Viewport transform (applied to every drawing call) ---- */
 static float g_vscale = 1.0f;
 static int   g_voffx  = 0;
 static int   g_voffy  = 0;
@@ -82,24 +81,21 @@ static const struct asset *get_asset(int id) {
     return &asset_table[id];
 }
 
-/* -----------------------------------------------------------------
-   SOURCE-MAJOR scaled blit.
-   For every source pixel (sx, sy), the destination region it fills is
-     [ sx*dst_w/src_w , (sx+1)*dst_w/src_w )   x
-     [ sy*dst_h/src_h , (sy+1)*dst_h/src_h )
-   That's ONE division per source pixel instead of one per destination
-   pixel — ~25x fewer divisions per frame.  This is the fix for the
-   FPS drop: previously the dst-major loop did ~4M divisions/frame.
--------------------------------------------------------------------- */
+/* Alpha below this is treated as fully transparent; above is fully opaque. */
+#define ALPHA_CUTOFF 32
+
+/* Source-major scaled blit using Bresenham-style accumulators.
+   For each source pixel (sx, sy) we compute the destination rectangle
+   [dx0, dx1) x [dy0, dy1) that it fills, using only adds and subtracts —
+   no integer divisions in the inner loops. */
 static void blit_indexed_fp(const u8 *pal, const u8 *idx,
                             int src_w, int src_h,
                             int dst_x, int dst_y,
                             int dst_w, int dst_h,
                             u8 alpha, int force_opaque)
 {
-    if (dst_w < 1 || dst_h < 1) return;
+    if (dst_w < 1 || dst_h < 1 || src_w < 1 || src_h < 1) return;
 
-    /* Clip against the viewport in framebuffer coords */
     int vpx0 = g_voffx;
     int vpy0 = g_voffy;
     int vpx1 = g_voffx + render_viewport_w();
@@ -109,11 +105,9 @@ static void blit_indexed_fp(const u8 *pal, const u8 *idx,
     if (vpx1 > SCR_W) vpx1 = SCR_W;
     if (vpy1 > SCR_H) vpy1 = SCR_H;
 
-    /* Early out: entire destination off-screen */
     if (dst_x >= vpx1 || dst_x + dst_w <= vpx0) return;
     if (dst_y >= vpy1 || dst_y + dst_h <= vpy0) return;
 
-    /* Clip in destination-local coords */
     int cx0 = 0, cy0 = 0, cx1 = dst_w, cy1 = dst_h;
     if (dst_x + cx0 < vpx0) cx0 = vpx0 - dst_x;
     if (dst_y + cy0 < vpy0) cy0 = vpy0 - dst_y;
@@ -121,55 +115,70 @@ static void blit_indexed_fp(const u8 *pal, const u8 *idx,
     if (dst_y + cy1 > vpy1) cy1 = vpy1 - dst_y;
     if (cx1 <= cx0 || cy1 <= cy0) return;
 
-    /* Narrow the source rows we iterate: only those whose destination
-       rows intersect [cy0, cy1).  Same trick as the columns. */
+    /* First/last source row that can contribute. */
     int sy_start = (cy0 * src_h) / dst_h;
-    int sy_end   = ((cy1 - 1) * src_h) / dst_h + 1;
+    int sy_end   = ((cy1 * src_h) + dst_h - 1) / dst_h;
     if (sy_start < 0) sy_start = 0;
     if (sy_end > src_h) sy_end = src_h;
+    if (sy_end <= sy_start) return;
+
+    /* Prime the Y accumulator to sy_start's starting position. */
+    u32 y_acc = (u32)sy_start * (u32)dst_h;
+    int dy_cur = (int)(y_acc / (u32)src_h);
+    y_acc %= (u32)src_h;
 
     for (int sy = sy_start; sy < sy_end; sy++) {
-        int dy0 = (sy * dst_h) / src_h;
-        int dy1 = ((sy + 1) * dst_h) / src_h;
-        if (dy1 <= dy0) dy1 = dy0 + 1;
+        y_acc += (u32)dst_h;
+        int dy_next = dy_cur;
+        while (y_acc >= (u32)src_h) { y_acc -= (u32)src_h; dy_next++; }
+        int dy0 = dy_cur;
+        int dy1 = dy_next;
+        dy_cur = dy_next;
 
-        if (dy0 < cy0) dy0 = cy0;
-        if (dy1 > cy1) dy1 = cy1;
-        if (dy1 <= dy0) continue;
+        int ccy0 = dy0, ccy1 = dy1;
+        if (ccy0 < cy0) ccy0 = cy0;
+        if (ccy1 > cy1) ccy1 = cy1;
+        if (ccy1 <= ccy0) continue;
+
+        int py0 = dst_y + ccy0;
+        int py1 = dst_y + ccy1;
 
         const u8 *srow = idx + sy * src_w;
-        int py0 = dst_y + dy0;
-        int py1 = dst_y + dy1;
 
-        int dx_prev = 0;
+        u32 x_acc = 0;
+        int dx_cur = 0;
+
         for (int sx = 0; sx < src_w; sx++) {
-            int dx_next = ((sx + 1) * dst_w) / src_w;
-            if (dx_next <= dx_prev) dx_next = dx_prev + 1;
-
-            int dx0 = dx_prev;
+            x_acc += (u32)dst_w;
+            int dx_next = dx_cur;
+            while (x_acc >= (u32)src_w) { x_acc -= (u32)src_w; dx_next++; }
+            if (dx_next <= dx_cur) dx_next = dx_cur + 1;
+            int dx0 = dx_cur;
             int dx1 = dx_next;
-            dx_prev = dx_next;
+            dx_cur = dx_next;
 
-            if (dx0 < cx0) dx0 = cx0;
-            if (dx1 > cx1) dx1 = cx1;
-            if (dx1 <= dx0) continue;
+            int ccx0 = dx0, ccx1 = dx1;
+            if (ccx0 < cx0) ccx0 = cx0;
+            if (ccx1 > cx1) ccx1 = cx1;
+            if (ccx1 <= ccx0) continue;
 
             u8  i  = srow[sx];
             u32 sa = pal[i*4+3];
             if (sa == 0) continue;
 
-            u8 ea;
+            u32 col;
             if (force_opaque) {
-                ea = 255;
+                col = 0xFF000000u | (pal[i*4+0] << 16)
+                                   | (pal[i*4+1] << 8) | pal[i*4+2];
             } else {
-                ea = (u8)((sa * alpha) >> 8);
-                if (ea == 0) continue;
+                u32 v = (sa * (u32)alpha) >> 8;
+                if (v < ALPHA_CUTOFF) continue;
+                col = 0xFF000000u | (pal[i*4+0] << 16)
+                                   | (pal[i*4+1] << 8) | pal[i*4+2];
             }
-            u32 col = ((u32)ea << 24) | (pal[i*4+0] << 16)
-                                       | (pal[i*4+1] << 8) | pal[i*4+2];
 
-            int px0 = dst_x + dx0;
-            int span = dx1 - dx0;
+            int px0  = dst_x + ccx0;
+            int span = ccx1 - ccx0;
 
             for (int py = py0; py < py1; py++) {
                 u32 *row = cur + py * SCR_W + px0;
@@ -218,7 +227,6 @@ void render_blit_scaled_bg_fp(int id, float xf, int scale_fp) {
                     x0, g_voffy, dst_w, dst_h, 255, 1);
 }
 
-/* ---- Legacy integer blits (kept for compatibility) ---- */
 void render_blit_scaled(int id, float xf, float yf, float scl, u8 alpha) {
     render_blit_scaled_fp(id, xf, yf, (int)(scl * 256.0f + 0.5f), alpha);
 }
@@ -238,8 +246,6 @@ void render_blit_tiled(int id, float scroll_x, float scale) {
     for (int x = base_x; x < SCR_W; x += tile_w)
         render_blit_scaled(id, (float)x, 0.0f, scale, 255);
 }
-
-/* ---- Anti-aliased text ---- */
 
 void render_text(int x, int y, const char *s, u32 c, int scale) {
     int sx = (int)(x * g_vscale + g_voffx + 0.5f);
