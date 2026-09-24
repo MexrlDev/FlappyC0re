@@ -22,6 +22,38 @@ struct ext_args_lua {
 
 PERSIST static void *G, *D;
 
+/* ---------------- ELF relocations ---------------- */
+
+typedef struct {
+    u64 r_offset;
+    u64 r_info;
+    s64 r_addend;
+} Elf64_Rela;
+
+#define R_X86_64_RELATIVE 8
+
+/* Walk __rela_start..__rela_end and rebase every R_X86_64_RELATIVE entry
+   from the link base (0) to the runtime load base.  Must run before any
+   data pointer is dereferenced. */
+static int apply_relocations(void) {
+    u64 rs, re, base;
+    __asm__ volatile("lea __rela_start(%%rip), %0" : "=r"(rs));
+    __asm__ volatile("lea __rela_end(%%rip),   %0" : "=r"(re));
+    __asm__ volatile("lea _start(%%rip),       %0" : "=r"(base));
+
+    if (re <= rs) return 0;
+
+    int count = 0;
+    for (Elf64_Rela *r = (Elf64_Rela*)rs; (u64)r < re; r++) {
+        u32 type = (u32)(r->r_info & 0xFFFFFFFFu);
+        if (type == R_X86_64_RELATIVE) {
+            *(u64 *)(base + r->r_offset) = base + (u64)r->r_addend;
+            count++;
+        }
+    }
+    return count;
+}
+
 /* ---------------- video ---------------- */
 
 PERSIST static s32 video_h = -1;
@@ -48,8 +80,6 @@ PERSIST static u8 lb_data[4];
 
 PERSIST static struct game game;
 
-/* Haptic timer: while now_ms() < haptic_until, the motors stay at the
-   values set by the last haptic() call.  When it expires we drop to 0. */
 PERSIST static u32 haptic_until_ms;
 PERSIST static u8  haptic_large, haptic_small;
 
@@ -98,8 +128,6 @@ static void haptic_raw(u8 large, u8 small) {
     haptic_large = large;
     haptic_small = small;
     if (!game.vibration_on) {
-        /* Still remember the value so toggling ON picks it up, but
-           don't touch the hardware. */
         if (pad_h >= 0 && pad_vib_fn) {
             vib_data[0] = 0; vib_data[1] = 0;
             for (int i = 2; i < 8; i++) vib_data[i] = 0;
@@ -114,26 +142,21 @@ static void haptic_raw(u8 large, u8 small) {
     NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
 }
 
-/* Low pulse on jump.  Short enough that rapid taps don't stack into
-   a continuous rumble. */
 static void haptic_low_pulse(void) {
     haptic_raw(80, 80);
     haptic_until_ms = now_ms() + 40;
 }
 
-/* Strong on death, held for a full second. */
 static void haptic_death(void) {
     haptic_raw(255, 255);
     haptic_until_ms = now_ms() + 1000;
 }
 
-/* Medium on restart-after-death.  Short. */
 static void haptic_restart(void) {
     haptic_raw(128, 128);
     haptic_until_ms = now_ms() + 200;
 }
 
-/* Called once per frame; drops the motors to 0 when the timer expires. */
 static void haptic_tick(void) {
     if (haptic_until_ms && now_ms() >= haptic_until_ms) {
         haptic_until_ms = 0;
@@ -141,7 +164,6 @@ static void haptic_tick(void) {
     }
 }
 
-/* When the user toggles vibration OFF, silence the motors immediately. */
 static void haptic_apply_toggle(void) {
     if (!game.vibration_on) {
         haptic_until_ms = 0;
@@ -164,15 +186,15 @@ static void lightbar(u8 r, u8 g, u8 b) {
     NC(G, pad_lb_fn, (u64)pad_h, (u64)lb_data, 0,0,0,0);
 }
 
-static const u32 LB_MENU     = 0x0000C8u;   /* (0, 0, 200) soft blue */
-static const u32 LB_PLAYING  = 0xFFDC00u;   /* (255, 220, 0) yellow  */
-static const u32 LB_DEAD     = 0xFF0000u;   /* (255, 0, 0) red       */
+static const u32 LB_MENU    = 0x0000C8u;
+static const u32 LB_PLAYING = 0xFFDC00u;
+static const u32 LB_DEAD    = 0xFF0000u;
 
 static void lightbar_apply(u32 rgb) {
     lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
-/* ---------------- video init ---------------- */
+/* ---------------- present / video init ---------------- */
 
 static void present(void) {
     NC(G, vid_flip, (u64)video_h, (u64)(total_frames & 1), 1,
@@ -272,7 +294,6 @@ static void pad_init_from(void) {
     if (p_init) NC(G, p_init, 0,0,0,0,0,0);
     if (p_geth) pad_h = (s32)NC(G, p_geth, 1, 0, 0, 0, 0, 0);
 
-    /* zero both motors and set default lightbar immediately */
     for (int i = 0; i < 8; i++) vib_data[i] = 0;
     if (pad_h >= 0 && pad_vib_fn)
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
@@ -454,7 +475,6 @@ static void menu_update(u32 pressed) {
             save_write(&game);
             break;
         case 5:
-            /* informational only */
             break;
         case 6:
             game.show_credits = 1;
@@ -462,7 +482,7 @@ static void menu_update(u32 pressed) {
         case 7:
             save_write(&game);
             haptic_raw(0, 0);
-            lightbar(0, 0, 200);   /* restore default soft blue */
+            lightbar(0, 0, 200);
             for (;;) sleep_ms(100);
         }
     }
@@ -473,7 +493,6 @@ static void menu_update(u32 pressed) {
 PERSIST static enum gstate last_gstate = 0xFF;
 
 static void game_update_and_draw(u32 pressed, float dt) {
-    /* Detect state transitions for haptics and lightbar */
     if (game.state != last_gstate) {
         if (game.state == GS_GAMEOVER) {
             haptic_death();
@@ -543,6 +562,8 @@ static void *audio_thread_entry(void *arg) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
+    int nreloc = apply_relocations();
+
     G = (void*)(eboot + GADGET_OFFSET);
     D = dlsym;
 
@@ -571,8 +592,9 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game.vibration_on = 1;
     save_load(&game);
 
-    printf("FlappyBird: video_h=%d pad=%d vib=%d lb=%d save=%d vib_on=%d\n",
-           video_h, pad_h, pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
+    printf("FlappyBird: relocs=%d video_h=%d pad=%d vib=%d lb=%d save=%d vib_on=%d\n",
+           nreloc, video_h, pad_h,
+           pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), game.vibration_on);
 
     void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
