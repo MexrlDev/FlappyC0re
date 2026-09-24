@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Bake an anti-aliased ASCII font.
-
-Writes:
-  src/font_aa.bin         — packed alpha bitmaps (concatenated glyph bboxes)
-  src/font_aa_metrics.h   — glyph metric table (with per-glyph byte offset)
-"""
+"""Bake an anti-aliased ASCII font with proper baseline alignment."""
 import os
 from PIL import Image, ImageDraw, ImageFont
 
-PX_HEIGHT = 40
-CELL_W    = 48
-CELL_H    = 56
+PX_HEIGHT  = 40
+CELL_W     = 48
+CELL_H     = 56
+BASELINE_Y = 40          # baseline row inside the cell
+PAD_X      = 2
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -51,10 +48,15 @@ def bake():
         ch  = chr(code)
         img = Image.new("L", (CELL_W, CELL_H), 0)
         draw = ImageDraw.Draw(img)
+
+        # Baseline-anchored rendering: every glyph shares the same baseline
+        # so 'e' and 'M' and 'y' align correctly.
         try:
-            draw.text((0, 0), ch, fill=255, font=font, anchor="lt")
-        except TypeError:
-            draw.text((0, 0), ch, fill=255, font=font)
+            draw.text((PAD_X, BASELINE_Y), ch, fill=255, font=font, anchor="ls")
+        except (TypeError, ValueError):
+            # Older Pillow: fall back to default (left, ascender) which is
+            # also baseline-consistent.
+            draw.text((PAD_X, 0), ch, fill=255, font=font)
 
         bbox = img.getbbox()
         if bbox is None:
