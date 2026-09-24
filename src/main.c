@@ -21,7 +21,8 @@ struct ext_args_lua {
 };
 
 PERSIST static void *G, *D;
-PERSIST static s32 g_user_id = 1;   /* default to 1, override after query */
+PERSIST static s32 g_user_id = 1;
+PERSIST static volatile int g_exit_now = 0;
 
 /* ---------------- early diagnostic ---------------- */
 
@@ -119,7 +120,6 @@ PERSIST static void *pad_lb_fn;
 PERSIST static u8 pad_buf[128];
 PERSIST static u32 pad_prev;
 PERSIST static u8 vib_data[8];
-PERSIST static u8 lb_data[4];
 
 /* ---------------- game ---------------- */
 
@@ -165,6 +165,27 @@ static u32 pad_pressed(void) {
     u32 p = cur & ~pad_prev;
     pad_prev = cur;
     return p;
+}
+
+/* ---------------- lightbar (stack-local struct) ---------------- */
+
+static void lightbar(u8 r, u8 g, u8 b) {
+    if (pad_h < 0 || !pad_lb_fn) return;
+    struct { u8 r, g, b, x; } col;
+    col.r = r;
+    col.g = g;
+    col.b = b;
+    col.x = 0;
+    NC(G, pad_lb_fn, (u64)pad_h, (u64)&col, 0,0,0,0);
+}
+
+static const u32 LB_MENU    = 0xFFDC00u;   /* yellow */
+static const u32 LB_PLAYING = 0xFFDC00u;   /* yellow */
+static const u32 LB_DEAD    = 0xFF0000u;   /* red */
+static const u32 LB_DEFAULT = 0x0000C8u;   /* Sony soft blue */
+
+static void lightbar_apply(u32 rgb) {
+    lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
 /* ---------------- haptics ---------------- */
@@ -220,25 +241,6 @@ static void haptic_apply_toggle(void) {
     }
 }
 
-/* ---------------- lightbar ---------------- */
-
-static void lightbar(u8 r, u8 g, u8 b) {
-    if (pad_h < 0 || !pad_lb_fn) return;
-    lb_data[0] = r;
-    lb_data[1] = g;
-    lb_data[2] = b;
-    lb_data[3] = 0;
-    NC(G, pad_lb_fn, (u64)pad_h, (u64)lb_data, 0,0,0,0);
-}
-
-static const u32 LB_MENU    = 0xFFDC00u;   /* yellow — on entry */
-static const u32 LB_PLAYING = 0xFFDC00u;   /* yellow — while playing */
-static const u32 LB_DEAD    = 0xFF0000u;   /* red on game over */
-
-static void lightbar_apply(u32 rgb) {
-    lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
-}
-
 /* ---------------- present / video init ---------------- */
 
 static void present(void) {
@@ -250,8 +252,6 @@ static void present(void) {
     } else {
         sleep_ms(16);
     }
-    /* Toggle draw target so next frame paints the buffer we are NOT
-       currently showing.  Without this the screen flickers. */
     render_swap();
     total_frames++;
 }
@@ -324,16 +324,13 @@ static void query_real_user_id(void) {
                           0,0,0,0,0);
     if (usr_mod < 0) { printf("query_uid: load usr_mod failed %d\n", usr_mod); return; }
 
-    void *get_init   = SYM(G, D, usr_mod, "sceUserServiceGetInitialUser");
-    void *get_fg     = SYM(G, D, usr_mod, "sceUserServiceGetForegroundUser");
-    void *get_login  = SYM(G, D, usr_mod, "sceUserServiceGetLoginUserIdList");
+    void *get_init = SYM(G, D, usr_mod, "sceUserServiceGetInitialUser");
+    void *get_fg   = SYM(G, D, usr_mod, "sceUserServiceGetForegroundUser");
 
-    printf("query_uid: init=%p fg=%p login=%p\n",
-           (void*)get_init, (void*)get_fg, (void*)get_login);
+    printf("query_uid: init=%p fg=%p\n", (void*)get_init, (void*)get_fg);
 
     s32 uid = 0;
     if (get_init) {
-        uid = 0;
         s32 r = (s32)NC(G, get_init, (u64)&uid, 0,0,0,0,0);
         printf("query_uid: GetInitialUser ret=%d uid=%d\n", r, uid);
         if (r == 0 && uid > 0) { g_user_id = uid; return; }
@@ -377,10 +374,9 @@ static void pad_init_from(void) {
     if (p_init) NC(G, p_init, 0,0,0,0,0,0);
 
     if (p_geth) {
-        /* Try several user ids, in order of likelihood. */
         s32 candidates[6];
         int n = 0;
-        candidates[n++] = g_user_id;   /* real user id from C query */
+        candidates[n++] = g_user_id;
         candidates[n++] = 1;
         candidates[n++] = 0;
         candidates[n++] = 0xFF;
@@ -400,8 +396,14 @@ static void pad_init_from(void) {
     if (pad_h >= 0 && pad_vib_fn)
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
 
-    /* Yellow lightbar as soon as we take over. */
-    lightbar_apply(LB_MENU);
+    /* Yellow lightbar as soon as we take over.  Try a few times in case
+       the pad handle needs a moment to fully attach. */
+    for (int i = 0; i < 5; i++) {
+        lightbar_apply(LB_MENU);
+        sleep_ms(30);
+    }
+    printf("lightbar set to yellow (pad_h=%d lb=%p)\n",
+           pad_h, (void*)pad_lb_fn);
 }
 
 /* ---------------- menu UI ---------------- */
@@ -422,15 +424,15 @@ static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
     render_text_center(60,  "CREDITS", 0xFFFFC030u, 10);
 
-    render_text_center(180, "PROGRAMMER", 0xFF808080u, 4);
-    render_text_center(240, "MexrlDev",    0xFFFFFFFFu, 6);
+    render_text_center(160, "PROGRAMMER", 0xFF808080u, 4);
+    render_text_center(210, "MexrlDev",    0xFFFFFFFFu, 6);
 
-    render_text_center(380, "SPECIAL THANKS", 0xFF808080u, 4);
-    render_text_center(440, "Egycnq  -  EmuC0re",  0xFFD0D0D0u, 4);
-    render_text_center(490, "Gezine  -  LuaC0re",  0xFFD0D0D0u, 4);
+    render_text_center(320, "SPECIAL THANKS", 0xFF808080u, 4);
+    render_text_center(370, "Egycnq  -  EmuC0re / DooMC0re", 0xFFD0D0D0u, 4);
+    render_text_center(410, "Gezine  -  LuaC0re",            0xFFD0D0D0u, 4);
 
-    render_text_center(610, "ASSETS", 0xFF808080u, 4);
-    render_text_center(670, "Samuel Custodio (MIT)", 0xFFD0D0D0u, 4);
+    render_text_center(510, "ASSETS", 0xFF808080u, 4);
+    render_text_center(560, "Samuel Custodio (MIT)", 0xFFD0D0D0u, 4);
 
     render_text_center(880, "X or O to return", 0xFFC0C0C0u, 4);
 }
@@ -472,8 +474,8 @@ static void draw_menu(void) {
     }
 
     render_text(40, 940, "X: SELECT   O: BACK", 0xFF808080u, 3);
-    render_text(SCR_W - 40 - render_text_width("MexrlDev", 3),
-                940, "MexrlDev", 0xFF606060u, 3);
+    render_text(SCR_W - 40 - render_text_width("By MexrlDev", 3),
+                940, "By MexrlDev", 0xFF606060u, 3);
 
     char hi[64];
     snprintf(hi, sizeof(hi), "HIGH: %d   LIFETIME: %u",
@@ -584,11 +586,10 @@ static void menu_update(u32 pressed) {
             game.show_credits = 1;
             break;
         case 7:
+            /* Signal the main loop to tear down and return to LuaC0re. */
             save_write(&game);
-            haptic_raw(0, 0);
-            /* Restore the default soft blue before we hand back to LuaC0re. */
-            lightbar(0, 0, 200);
-            for (;;) sleep_ms(100);
+            g_exit_now = 1;
+            break;
         }
     }
 }
@@ -663,6 +664,47 @@ static void *audio_thread_entry(void *arg) {
     return 0;
 }
 
+/* ---------------- cleanup ---------------- */
+
+static void cleanup_and_return(struct ext_args_lua *ext) {
+    /* 1. Kill vibration */
+    if (pad_h >= 0 && pad_vib_fn) {
+        vib_data[0] = 0; vib_data[1] = 0;
+        for (int i = 2; i < 8; i++) vib_data[i] = 0;
+        NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+    }
+
+    /* 2. Restore Sony soft-blue lightbar */
+    lightbar_apply(LB_DEFAULT);
+    sleep_ms(80);
+
+    /* 3. Stop audio */
+    audio_shutdown();
+
+    /* 4. Blank the screen so the next payload starts on a clean slate */
+    if (fbs_mem) {
+        u32 *fb0 = (u32*)fbs_mem;
+        u32 *fb1 = (u32*)(fbs_mem + FB_ALIGNED);
+        for (int i = 0; i < SCR_W * SCR_H; i++) { fb0[i] = 0xFF000000; fb1[i] = 0xFF000000; }
+        if (vid_flip && video_h >= 0)
+            NC(G, vid_flip, (u64)video_h, 0, 1, 0, 0, 0);
+        sleep_ms(50);
+    }
+
+    /* 5. Close video */
+    if (vid_close && video_h >= 0)
+        NC(G, vid_close, (u64)video_h, 0,0,0,0,0);
+
+    /* 6. Delete event queue */
+    if (delete_eq && eq)
+        NC(G, delete_eq, eq, 0,0,0,0,0);
+
+    /* 7. Tell the Lua side we finished cleanly */
+    ext->status = 0;
+    ext->step   = 99;
+    ext->frame  = (u32)total_frames;
+}
+
 /* ---------------- entry point ---------------- */
 
 __attribute__((section(".text._start")))
@@ -677,7 +719,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
                       "RELOC ", (u64)nreloc);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "VIDEO\n", 6);
-
     if (video_init(eboot) != 0) {
         early_send(eboot, dlsym, ext->log_fd, ext->log_sa,
                    "VIDEO FAIL\n", 11);
@@ -685,7 +726,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     }
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "LIBC\n", 5);
-
     ps_libc_init(G, D,
         SYM(G, D, LIBKERNEL_HANDLE, "mmap"),
         SYM(G, D, LIBKERNEL_HANDLE, "sceKernelOpen"),
@@ -697,7 +737,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         SYM(G, D, LIBKERNEL_HANDLE, "sendto"),
         ext->log_fd, ext->log_sa);
 
-    /* Discover the real user id in C — the Lua fallback of 255 will not work. */
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "UID\n", 4);
     query_real_user_id();
     early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
@@ -736,7 +775,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     u32 last_ms = now_ms();
 
-    for (;;) {
+    while (!g_exit_now) {
         u32 cur_ms = now_ms();
         u32 dt_ms = cur_ms - last_ms;
         if (dt_ms > 50) dt_ms = 50;
@@ -746,11 +785,11 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         haptic_tick();
 
-        /* Log pad state every 60 frames for the first 15 seconds. */
-        if (total_frames < 900 && (total_frames % 60) == 0) {
+        /* Light pad logging for the first 5 s only. */
+        if (total_frames < 300 && (total_frames % 60) == 0) {
             u32 raw = read_pad();
-            printf("PAD f=%u raw=%08x prev=%08x state=%d\n",
-                   (unsigned)total_frames, raw, pad_prev, (int)game.state);
+            printf("PAD f=%u raw=%08x state=%d\n",
+                   (unsigned)total_frames, raw, (int)game.state);
         }
 
         u32 pressed = pad_pressed();
@@ -765,4 +804,11 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         present();
         if (!pc) audio_pump();
     }
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "EXIT\n", 5);
+    cleanup_and_return(ext);
+
+    /* Return to LuaC0re.  The Lua script ends after func_wrap, so control
+       passes back to the loader. */
+    return;
 }
