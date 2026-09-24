@@ -470,18 +470,24 @@ static void audio_init_from(void) {
     audio_init(h, g_aud_out_fn, G);
 }
 
-/* Retries the new port open up to 8 times with 150 ms pauses between
-   attempts.  sceAudioOutClose returns success immediately but the
-   kernel holds the port for ~1 second while the audio queue drains.
-   Without the retry, rapid port switching always fails and the menu
-   looks stuck. */
+/* Try to open one specific port with retries.  Returns the handle or -1. */
+static s32 open_port_with_retries(u8 port, int attempts) {
+    s32 h = -1;
+    for (int i = 0; i < attempts && h < 0; i++) {
+        if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)port);
+        if (h < 0) h = try_open_audio_port(0xFF, (s32)port);
+        if (h < 0 && i + 1 < attempts) sleep_ms(150);
+    }
+    return h;
+}
+
+/* Close the current port first, wait for the kernel to release it, then
+   open the new one.  If the new port fails, reopen the old one.  */
 static void audio_restart_with_port(u8 new_port) {
     new_port = port_normalize(new_port);
     if (!g_aud_open_fn || !g_aud_close_fn) return;
 
     if (new_port == g_aud_actual_port && g_aud_handle >= 0) {
-        printf("audio: already on port %u (%s)\n",
-               (unsigned)new_port, game_audio_port_name(new_port));
         game.audio_port = new_port;
         return;
     }
@@ -492,39 +498,45 @@ static void audio_restart_with_port(u8 new_port) {
     g_audio_pause = 1;
     sleep_ms(80);
 
-    s32 h_new = -1;
-    for (int attempt = 0; attempt < 8 && h_new < 0; attempt++) {
-        if (g_user_id > 0) h_new = try_open_audio_port(g_user_id, (s32)new_port);
-        if (h_new < 0) h_new = try_open_audio_port(0xFF, (s32)new_port);
-        if (h_new < 0) {
-            printf("audio: retry %d for port %u (0x%08x)\n",
-                   attempt + 1, (unsigned)new_port, (unsigned)h_new);
-            sleep_ms(150);
-        }
-    }
-
-    if (h_new < 0) {
-        printf("audio: port %u unavailable after retries, staying on %u\n",
-               (unsigned)new_port, (unsigned)g_aud_actual_port);
-        g_audio_pause = 0;
-        return;
-    }
-
+    /* Step 1: close the current port. */
+    u8 old_port = g_aud_actual_port;
     s32 h_old = g_aud_handle;
-    g_aud_handle = h_new;
-    audio_init(h_new, g_aud_out_fn, G);
-
     if (h_old >= 0) {
         NC(G, g_aud_close_fn, (u64)h_old, 0,0,0,0,0);
+        g_aud_handle = -1;
     }
 
+    /* Step 2: wait for the kernel to actually release it. */
+    sleep_ms(400);
+
+    /* Step 3: try to open the new port. */
+    printf("audio: opening port %u (%s)\n",
+           (unsigned)new_port, game_audio_port_name(new_port));
+    s32 h_new = open_port_with_retries(new_port, 8);
+
+    if (h_new < 0) {
+        printf("audio: port %u failed (0x%08x), reverting to %u (%s)\n",
+               (unsigned)new_port, (unsigned)h_new,
+               (unsigned)old_port, game_audio_port_name(old_port));
+        sleep_ms(200);
+        h_new = open_port_with_retries(old_port, 8);
+        if (h_new < 0) {
+            printf("audio: FATAL - cannot reopen port %u\n", (unsigned)old_port);
+            g_audio_pause = 0;
+            return;
+        }
+        new_port = old_port;
+    }
+
+    g_aud_handle = h_new;
     g_aud_actual_port = new_port;
-    game.audio_port   = new_port;
-    printf("audio: switched to port %u, handle=%d\n",
-           (unsigned)new_port, h_new);
+    game.audio_port = new_port;
+    audio_init(h_new, g_aud_out_fn, G);
+
+    printf("audio: handle=%d port=%u (%s)\n",
+           h_new, (unsigned)new_port, game_audio_port_name(new_port));
 
     sleep_ms(120);
-
     g_audio_pause = 0;
 }
 
@@ -589,14 +601,16 @@ static void reset_settings_to_default(void) {
     audio_set_master(game.sfx_volume);
     haptic_apply_toggle();
 
-    u8 target_port = PORT_TV;
-    if (g_aud_actual_port != target_port || game.audio_port != target_port) {
-        audio_restart_with_port(target_port);
+    if (g_aud_actual_port != PORT_TV) {
+        audio_restart_with_port(PORT_TV);
     } else {
-        game.audio_port = target_port;
+        game.audio_port = PORT_TV;
     }
 
     save_write(&game);
+
+    printf("reset: done, port=%s\n",
+           game_audio_port_name(game.audio_port));
 }
 
 static const char *menu_items[] = {
