@@ -82,6 +82,12 @@ design — are adapted from **DooMC0re** (GPL-2.0, by EgyDevTeam /
 egycnq). See `NOTICE` for details. No DooMC0re source code is copied into
 this repository; only the general architecture is reused.
 
+The DualSense lightbar control (`scePadSetLightBar`) and vibration control
+(`scePadSetVibration`) — including the per-state color scheme and haptic
+pulse pattern used here — are adapted from **ToolB0x** (MIT, by MexrlDev).
+No ToolB0x source code is copied into this repository; only the API usage
+pattern is reused.
+
 LuaC0re by Gezine. The 8×8 bitmap font is a small public-domain-style
 glyph table; the version here was typed out fresh for this port.
 
@@ -98,4 +104,5 @@ released under the **MIT License**. See `LICENSE`.
     Copyright (c) 2019 Samuel Custodio
 
 Architectural inspiration was drawn from DooMC0re (GPL-2.0),
-but no DooMC0re source code is present in this tree. See `NOTICE`.
+ToolB0x (MIT), and Doom-PS (MIT), but no source code from DooMC0re
+is present in this tree. See `NOTICE`.
