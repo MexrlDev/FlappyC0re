@@ -12,7 +12,7 @@ Flappy Bird sprites and audio
   Files: assets/*.png, assets/*.wav
   Notice: assets/Credits.txt
 
-Doom-PS (ps5-doom)
+Doom-PS
   Copyright (c) 2026 MexrlDev
   License: MIT
   Role: The platform-layer approach used here (single flat RWX mmap,
@@ -39,8 +39,3 @@ LuaC0re exploit framework (external dependency, not bundled)
   Copyright (c) Gezine
   Source: https://github.com/Gezine/Luac0re
   License: see upstream
-
-8x8 bitmap font
-  The glyph table in src/font.h was typed out fresh for this port from
-  the standard 8x8 console font geometry. It is not copied from any
-  GPL source.
