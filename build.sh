@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -e
 
+# ---------- Assets ----------
 # Auto-fetch assets if the directory is empty
 if [ ! -f assets/background-day.png ]; then
   echo "Assets missing — fetching from MexrlDev/PsVue-Mod..."
   ./tools/fetch_assets.sh assets
 fi
 
-# Sanity check
+# Sanity check — every source asset must be present
 missing=0
 for f in background-day.png background-night.png base.png \
          gameover.png hit.wav jump.wav \
@@ -17,6 +18,19 @@ for f in background-day.png background-night.png base.png \
 done
 [ "$missing" -eq 0 ] || exit 1
 
+# ---------- Font atlas ----------
+# If the AA font atlas isn't checked in, bake it now (needs Pillow + a TTF).
+if [ ! -f src/font_aa.bin ] || [ ! -f src/font_aa_metrics.h ]; then
+  echo "Font atlas missing — baking from system TTF..."
+  python3 tools/bake_font.py
+fi
+
+# ---------- Asset table ----------
+# Generates src/assets.h, src/assets.bin, src/assets.S from the raw assets.
+echo "Baking assets..."
+python3 tools/bake_assets.py
+
+# ---------- Build ----------
 make clean
 make -j"$(nproc)"
 make hex
