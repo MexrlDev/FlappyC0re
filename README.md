@@ -3,7 +3,7 @@
 ---
 ## Screenshots
 
-<img src="https://raw.githubusercontent.com/MexrlDev/FlappyC0re/refs/heads/main/.Images/IMG_0564.jpeg?token=GHSAT0AAAAAAD6SGBT2DFX6M46ZNZC5V2A42VVFDJA" width="600">
+<img src="https://raw.githubusercontent.com/MexrlDev/FlappyC0re/refs/heads/main/.Images/IMG_0564.jpeg" width="600">
 
 <details>
 <summary>More Screenshots</summary>
