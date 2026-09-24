@@ -3,8 +3,8 @@
 #include "render.h"
 #include "audio.h"
 
-#define GRAVITY      (0.5f * 60.0f * 60.0f)   /* 1800 px/sec^2 */
-#define JUMP_FORCE   (-10.0f * 60.0f)         /* -600 px/sec   */
+#define GRAVITY      (0.5f * 60.0f * 60.0f)
+#define JUMP_FORCE   (-10.0f * 60.0f)
 
 #define BIRD_X        BIRD_X_POS
 #define BIRD_W_F      ((float)BIRD_W)
@@ -15,12 +15,26 @@
 #define MAX_RAMP_SPEED 12.0f
 #define RAMP_STEP      0.25f
 
+/* Minimum pixels of top pipe that must remain visible on screen so the
+   gap is never so high that the top pipe disappears entirely. */
+#define MIN_TOP_PIPE_VISIBLE 45.0f
+
 const char *game_diff_name(enum diff d) {
     switch (d) {
     case DIFF_EASY:   return "EASY";
     case DIFF_NORMAL: return "NORMAL";
     case DIFF_HARD:   return "HARD";
     case DIFF_RACER:  return "RACER";
+    default:          break;
+    }
+    return "?";
+}
+
+const char *game_screen_name(enum screen_mode m) {
+    switch (m) {
+    case SCREEN_FULL: return "FULL";
+    case SCREEN_16_9: return "16:9";
+    case SCREEN_4_3:  return "4:3";
     default:          break;
     }
     return "?";
@@ -71,9 +85,14 @@ static u32 rng_next(void) {
 }
 
 static void spawn_pipe(struct game *g) {
-    float min_gap_y = g->pipe_gap;
+    /* Clamp the gap center so the top pipe's bottom edge is always at
+       least MIN_TOP_PIPE_VISIBLE pixels down from the top of the
+       screen, and the bottom pipe's top edge is never past the ground. */
+    float min_gap_y = g->pipe_gap + MIN_TOP_PIPE_VISIBLE;
     float max_gap_y = SCREEN_H_F - GROUND_H_F - g->pipe_gap - 10.0f;
-    float t = (float)(rng_next() & 0x7FFF) / 32768.0f;
+    if (max_gap_y < min_gap_y) max_gap_y = min_gap_y;
+
+    float t  = (float)(rng_next() & 0x7FFF) / 32768.0f;
     float gy = min_gap_y + t * (max_gap_y - min_gap_y);
 
     struct pipe_pair *p = obtain(g);
@@ -92,6 +111,7 @@ void game_init(struct game *g) {
     }
     g->active_count = 0;
     g->state = GS_MENU;
+    g->screen_mode = SCREEN_FULL;
     g->menu_cursor = 0;
     g->show_credits = 0;
     g->vibration_on = 1;
