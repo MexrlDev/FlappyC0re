@@ -1,15 +1,15 @@
+/* SPDX-License-Identifier: MIT */
 #include "game.h"
 #include "render.h"
 #include "audio.h"
 
-/* Physics constants straight from Mexrl's JS */
-#define GRAVITY      (0.5f * 60.0f)     /* px per second^2, tuned at 60 fps */
-#define JUMP_FORCE   (-10.0f * 60.0f)   /* px per second */
+#define GRAVITY      (0.5f * 60.0f)
+#define JUMP_FORCE   (-10.0f * 60.0f)
 
 #define BIRD_X        300.0f
 #define BIRD_W        34.0f * 6.0f
 #define BIRD_H        24.0f * 6.0f
-#define GROUND_H      (112.0f * (1080.0f / 512.0f))  /* base height at 1080p */
+#define GROUND_H      (112.0f * (1080.0f / 512.0f))
 #define SCREEN_H_F    1080.0f
 
 #define MAX_RAMP_SPEED 12.0f
@@ -21,6 +21,7 @@ const char *game_diff_name(enum diff d) {
     case DIFF_NORMAL: return "NORMAL";
     case DIFF_HARD:   return "HARD";
     case DIFF_RACER:  return "RACER";
+    default:          break;
     }
     return "?";
 }
@@ -31,6 +32,7 @@ float game_diff_pipe_speed(enum diff d) {
     case DIFF_NORMAL: return 5.0f;
     case DIFF_HARD:   return 7.0f;
     case DIFF_RACER:  return 5.0f;
+    default:          break;
     }
     return 5.0f;
 }
@@ -41,6 +43,7 @@ float game_diff_pipe_gap(enum diff d) {
     case DIFF_NORMAL: return 300.0f;
     case DIFF_HARD:   return 240.0f;
     case DIFF_RACER:  return 300.0f;
+    default:          break;
     }
     return 300.0f;
 }
@@ -58,13 +61,14 @@ static void release(struct game *g, struct pipe_pair *p) {
 static struct pipe_pair *obtain(struct game *g) {
     for (int i = 0; i < POOL_PAIRS; i++)
         if (!g->pool[i].active) return &g->pool[i];
-    return &g->pool[0];   /* all in use; reuse first (shouldn't happen) */
+    return &g->pool[0];
 }
 
 static void spawn_pipe(struct game *g) {
     float min_gap_y = g->pipe_gap;
     float max_gap_y = SCREEN_H_F - GROUND_H - g->pipe_gap - 10.0f;
-    float t = (float)(int)(g->lifetime_pipes * 1103515245u + 12345u) / 2147483648.0f;
+    float t = (float)((g->lifetime_pipes * 1103515245u + 12345u) & 0x7FFFFFFFu)
+              / 2147483648.0f;
     float gy = min_gap_y + t * (max_gap_y - min_gap_y);
 
     struct pipe_pair *p = obtain(g);
@@ -84,6 +88,8 @@ void game_init(struct game *g) {
     g->active_count = 0;
     g->state = GS_MENU;
     g->menu_cursor = 0;
+    g->show_credits = 0;
+    g->vibration_on = 1;
     game_set_diff(g, DIFF_NORMAL);
     g->is_night = 0;
     g->score = 0;
@@ -170,7 +176,6 @@ static int aabb(float ax, float ay, float aw, float ah,
 
 void game_update(struct game *g, float dt) {
     if (g->state == GS_READY || g->state == GS_PLAYING) {
-        /* physical sim continues on READY so the bird hovers */
         if (g->state == GS_PLAYING) {
             g->bird_vy += GRAVITY * dt;
         } else {
@@ -203,7 +208,6 @@ void game_update(struct game *g, float dt) {
         }
     }
 
-    /* Background scroll is always on, matching the original JS */
     g->bg_scroll   -= (g->pipe_speed / 3.0f) * 60.0f * dt;
     g->base_scroll -= g->pipe_speed * 60.0f * dt;
 
