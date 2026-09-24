@@ -39,13 +39,8 @@ const char *game_screen_name(enum screen_mode m) {
 
 const char *game_audio_port_name(u8 port) {
     switch (port) {
-    case 0: return "TV";
-    case 1: return "BGM";
-    case 2: return "VOICE";
+    case 2: return "TV";
     case 3: return "HEADSET";
-    case 4: return "CONTROLLER";
-    case 5: return "AUX";
-    case 6: return "ALT";
     default: break;
     }
     return "TV";
@@ -124,7 +119,7 @@ void game_init(struct game *g) {
     g->show_credits = 0;
     g->vibration_on = 1;
     g->sfx_volume   = 100;
-    g->audio_port   = 0;
+    g->audio_port   = 2;
     game_set_diff(g, DIFF_NORMAL);
     g->is_night = 0;
     g->score = 0;
