@@ -25,6 +25,8 @@ enum screen_mode {
     SCREEN_MODE_COUNT
 };
 
+#define AUDIO_PORT_COUNT 7
+
 struct pipe_pair {
     float x;
     float y_top, y_bot;
@@ -56,7 +58,8 @@ struct game {
 
     int   menu_cursor;
     u8    vibration_on;
-    u8    sfx_volume;      /* 0 = OFF, 1..99 partial, 100 = ON */
+    u8    sfx_volume;
+    u8    audio_port;
     u8    show_credits;
 
     u32   flash_until_ms;
@@ -104,5 +107,6 @@ float  game_diff_pipe_speed(enum diff d);
 float  game_diff_pipe_gap(enum diff d);
 const char *game_diff_name(enum diff d);
 const char *game_screen_name(enum screen_mode m);
+const char *game_audio_port_name(u8 port);
 
 #endif
