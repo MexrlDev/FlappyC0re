@@ -54,7 +54,7 @@ EXIT
 ## Setup
 1. Get the release zip, or copy the lua/py from the source code from this repo
 2. Make sure to edit the python to add your PlayStation or luac0re IP address so payload gets send
-2.1 In Pythonica/PyCode for mobile go to SetUp for mobile
+2.1 In Pythonica/PyCode for mobile go to [SetUp for mobile](https://github.com/MexrlDev/repo/tree/main/Mobile-Python-Tools#how-to-setup-the-scripts-in-this-folder)
 3. for pc just start it via going to Python and starting it via shellcode Python3 flappy_launcher.py
 
 ---
