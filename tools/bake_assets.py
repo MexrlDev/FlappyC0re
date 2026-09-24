@@ -1,67 +1,100 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Bake assets for the Flappy payload.
+"""Bake PNG + WAV assets into a single blob + header.
 
-Reads assets/*.png and assets/*.wav, writes:
-  src/assets.h     — enum + struct table
-  src/assets.bin   — packed blob
-  src/assets.S     — assembly wrapper around the blob
-
-Image format on disk (per asset):
-  1024 bytes    palette, 256 entries x (R, G, B, A)
-  w*h bytes     index into palette, row-major
-
-Audio format on disk:
-  h*2 bytes     s16 little-endian mono samples at 48 kHz
+PNGs are quantized to 8-bit indexed with a 1 KB RGBA palette.  Slot 0 is
+permanently reserved for transparent pixels; every other slot holds an
+opaque RGBA triple.  WAVs are downmixed to mono S16 and resampled to
+48 kHz with linear interpolation.
 """
 import os
+import sys
+import wave
 import struct
 from PIL import Image
-import wave
 
-ASSETS_DIR = "assets"
-SRC_DIR    = "src"
-
-IMAGE_ASSETS = [
-    ("bg_day",    "background-day.png",      "A_BG_DAY"),
-    ("bg_night",  "background-night.png",    "A_BG_NIGHT"),
-    ("base",      "base.png",                "A_BASE"),
-    ("pipe_top",  "pipe-green-top.png",      "A_PIPE_TOP"),
-    ("pipe_bot",  "pipe-green.png",          "A_PIPE_BOT"),
-    ("bird_down", "yellowbird-downflap.png", "A_BIRD_DOWN"),
-    ("bird_mid",  "yellowbird-midflap.png",  "A_BIRD_MID"),
-    ("bird_up",   "yellowbird-upflap.png",   "A_BIRD_UP"),
-    ("gameover",  "gameover.png",            "A_GAMEOVER"),
+ASSETS = [
+    ("bg_day",     "assets/background-day.png",                 "png"),
+    ("bg_night",   "assets/background-night.png",               "png"),
+    ("base",       "assets/base.png",                           "png"),
+    ("pipe_top",   "assets/pipe-green-top.png",                 "png"),
+    ("pipe_bot",   "assets/pipe-green.png",                     "png"),
+    ("bird_down",  "assets/yellowbird-downflap.png",            "png"),
+    ("bird_mid",   "assets/yellowbird-midflap.png",             "png"),
+    ("bird_up",    "assets/yellowbird-upflap.png",              "png"),
+    ("gameover",   "assets/gameover.png",                       "png"),
+    ("sfx_jump",   "assets/jump.wav",                           "wav"),
+    ("sfx_score",  "assets/score.wav",                          "wav"),
+    ("sfx_hit",    "assets/hit.wav",                            "wav"),
 ]
 
-AUDIO_ASSETS = [
-    ("sfx_jump",  "jump.wav",                "A_SFX_JUMP"),
-    ("sfx_score", "score.wav",               "A_SFX_SCORE"),
-    ("sfx_hit",   "hit.wav",                 "A_SFX_HIT"),
-]
+FMT_RGBA8_INDEXED = 0
+FMT_S16_MONO_48K  = 1
 
-# Pixels with source alpha below this are treated as fully transparent.
+# Source alpha below this is treated as fully transparent.  Everything
+# at or above is rendered fully opaque.  This is the correct treatment
+# for pixel art: the sprites have hard edges, and the only semi-alpha
+# in the source PNGs is anti-aliased fringe we want to snap opaque.
 ALPHA_CUTOFF = 8
 
 
-def quantize_rgba(img):
-    """RGBA image -> (palette_bytes, indices_bytes).
+def resample_linear(samples, in_rate, out_rate=48000):
+    """Linear-interpolate a list of ints from in_rate to out_rate."""
+    if in_rate == out_rate or not samples:
+        return samples
+    n = len(samples)
+    out_n = int(n * out_rate / in_rate)
+    out = [0] * out_n
+    ratio = in_rate / out_rate
+    for i in range(out_n):
+        pos = i * ratio
+        i0 = int(pos)
+        i1 = i0 + 1 if i0 + 1 < n else i0
+        frac = pos - i0
+        out[i] = int(samples[i0] + (samples[i1] - samples[i0]) * frac)
+    return out
 
-    Index 0 is permanently reserved for transparent pixels.  Every other
-    slot is keyed on exact RGB with alpha forced to 255, so solid white
-    and transparent white never share a slot.  This is what fixes the
-    "blank spots" on the pipe highlight and the bird's eye/beak.
 
-    If the image has more than 255 unique opaque colours, subsequent
-    pixels snap to the nearest non-transparent entry by squared RGB
-    distance.
+def read_wav_mono(path):
+    """Return (samples_48k_s16_list).  Accepts any sample rate, any
+    channel count, 16-bit PCM."""
+    with wave.open(path, "rb") as w:
+        nch = w.getnchannels()
+        sw  = w.getsampwidth()
+        fr  = w.getframerate()
+        n   = w.getnframes()
+        raw = w.readframes(n)
+
+    if sw != 2:
+        raise ValueError(f"{path}: expected 16-bit samples, got {sw*8}-bit")
+
+    samples = list(struct.unpack("<" + "h" * n, raw[:2*n]))
+
+    if nch == 2:
+        samples = [(samples[i] + samples[i+1]) // 2 for i in range(0, n, 2)]
+    elif nch != 1:
+        raise ValueError(f"{path}: expected mono or stereo, got {nch}ch")
+
+    if fr != 48000:
+        samples = resample_linear(samples, fr, 48000)
+
+    return samples
+
+
+def bake_png(path):
+    """Return (palette_bytes, indices_bytes, w, h).
+
+    Palette format: 256 entries * (R,G,B,A) = 1024 bytes.
+      - Slot 0 is permanently (0,0,0,0) — transparent.
+      - Every other slot holds an opaque RGB triple with A=255.
+    Indices format: w*h bytes, row-major.
     """
-    img = img.convert("RGBA")
+    img = Image.open(path).convert("RGBA")
     w, h = img.size
     px = list(img.getdata())
 
     palette = [(0, 0, 0, 0)]           # slot 0 = transparent
-    lookup  = {(0, 0, 0, 255): 0}      # sentinel so nothing ever maps to 0
+    lookup  = {}                       # (R,G,B,255) -> palette index
 
     indices = bytearray(w * h)
 
@@ -78,6 +111,8 @@ def quantize_rgba(img):
                 palette.append(key)
                 lookup[key] = idx
             else:
+                # Out of slots: snap to the nearest non-transparent
+                # palette entry by squared RGB distance.
                 best   = 1
                 best_d = 1 << 30
                 for j, (pr, pg, pb, pa) in enumerate(palette):
@@ -101,69 +136,37 @@ def quantize_rgba(img):
     while len(pal_bytes) < 1024:
         pal_bytes.extend((0, 0, 0, 0))
 
-    return bytes(pal_bytes), bytes(indices)
-
-
-def read_wav_s16(path):
-    with wave.open(path, "rb") as w:
-        nch = w.getnchannels()
-        sw  = w.getsampwidth()
-        fr  = w.getframerate()
-        n   = w.getnframes()
-        raw = w.readframes(n)
-
-        if sw != 2:
-            raise ValueError(f"{path}: expected 16-bit samples, got {sw*8}-bit")
-        if fr != 48000:
-            raise ValueError(f"{path}: expected 48000 Hz, got {fr}")
-
-        samples = struct.unpack("<" + "h" * n, raw[:2*n])
-        if nch == 2:
-            samples = tuple(
-                (samples[i] + samples[i+1]) // 2 for i in range(0, n, 2)
-            )
-        elif nch != 1:
-            raise ValueError(f"{path}: expected mono or stereo, got {nch}ch")
-        return list(samples)
+    return bytes(pal_bytes), bytes(indices), w, h
 
 
 def main():
-    os.makedirs(SRC_DIR, exist_ok=True)
-
-    blob    = bytearray()
+    blob = bytearray()
     entries = []   # (enum_name, offset, w, h, fmt)
 
-    FMT_RGBA = 0
-    FMT_S16  = 1
+    for name, path, kind in ASSETS:
+        if not os.path.isfile(path):
+            print(f"[!] missing {path}", file=sys.stderr)
+            sys.exit(1)
 
-    for name, fname, enum in IMAGE_ASSETS:
-        path = os.path.join(ASSETS_DIR, fname)
-        img  = Image.open(path)
-        w, h = img.size
-        pal, idx = quantize_rgba(img)
-        data = pal + idx
+        if kind == "png":
+            pal, idx, w, h = bake_png(path)
+            data = pal + idx
+            off = len(blob)
+            blob += data
+            entries.append((f"A_{name.upper()}", off, w, h, FMT_RGBA8_INDEXED))
+            print(f"  {name:<11} PNG {w}x{h:<6} {len(data):>8} B")
+        else:
+            samples = read_wav_mono(path)
+            data = struct.pack("<" + "h" * len(samples), *samples)
+            off = len(blob)
+            blob += data
+            entries.append((f"A_{name.upper()}", off, 0, len(samples), FMT_S16_MONO_48K))
+            print(f"  {name:<11} WAV 48000Hz  {len(samples)} frames  {len(data):>8} B")
 
-        offset = len(blob)
-        blob.extend(data)
-        entries.append((enum, offset, w, h, FMT_RGBA))
-        print(f"  {name:<12} PNG {w}x{h:<6} {len(data):>8} B")
-
-    for name, fname, enum in AUDIO_ASSETS:
-        path = os.path.join(ASSETS_DIR, fname)
-        samples = read_wav_s16(path)
-        data = struct.pack("<" + "h" * len(samples), *samples)
-        offset = len(blob)
-        blob.extend(data)
-        entries.append((enum, offset, 0, len(samples), FMT_S16))
-        print(f"  {name:<12} WAV 48000Hz  {len(samples)} frames  {len(data):>8} B")
-
-    with open(os.path.join(SRC_DIR, "assets.bin"), "wb") as f:
-        f.write(blob)
-
-    with open(os.path.join(SRC_DIR, "assets.h"), "w") as f:
-        f.write("/* Auto-generated by tools/bake_assets.py - do not edit. */\n")
-        f.write("#ifndef ASSETS_H\n#define ASSETS_H\n\n")
-        f.write('#include "core.h"\n\n')
+    with open("src/assets.h", "w") as f:
+        f.write("/* SPDX-License-Identifier: MIT */\n")
+        f.write("/* generated by tools/bake_assets.py -- do not edit */\n")
+        f.write("#ifndef ASSETS_H\n#define ASSETS_H\n\n#include \"core.h\"\n\n")
         f.write("enum asset_fmt {\n")
         f.write("    ASSET_FMT_RGBA8_INDEXED = 0,\n")
         f.write("    ASSET_FMT_S16_MONO_48K  = 1,\n")
@@ -186,8 +189,12 @@ def main():
         f.write("};\n\n")
         f.write("#endif\n")
 
-    with open(os.path.join(SRC_DIR, "assets.S"), "w") as f:
-        f.write("/* Auto-generated by tools/bake_assets.py - do not edit. */\n")
+    with open("src/assets.bin", "wb") as f:
+        f.write(blob)
+
+    with open("src/assets.S", "w") as f:
+        f.write("/* SPDX-License-Identifier: MIT */\n")
+        f.write("/* generated by tools/bake_assets.py -- do not edit */\n")
         f.write("    .section .rodata\n")
         f.write("    .globl asset_blob\n")
         f.write("    .balign 16\n")
@@ -196,9 +203,6 @@ def main():
         f.write("    .globl asset_blob_end\n")
         f.write("asset_blob_end:\n")
         f.write("    .previous\n")
-
-    with open(os.path.join(SRC_DIR, ".assets.stamp"), "w") as f:
-        f.write("ok\n")
 
     print(f"\nbaked {len(entries)} assets, {len(blob)} bytes total")
 
