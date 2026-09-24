@@ -4,8 +4,8 @@
 extern const u8 asset_blob[];
 
 #define NUM_VOICES 32
-#define GRAIN      2048
-#define FADE_LEN   256
+#define GRAIN      1024          /* must match the buffer size opened in main.c */
+#define FADE_LEN   256           /* ~5.3 ms at 48 kHz */
 
 struct voice {
     const s16 *pcm;
@@ -26,6 +26,10 @@ PERSIST static u8 audio_master = 100;
 void audio_set_master(u8 v) {
     if (v > 100) v = 100;
     audio_master = v;
+}
+
+int audio_is_active(void) {
+    return audio_handle >= 0 && audio_out_fn != 0;
 }
 
 int audio_init(s32 h, void *fn, void *G) {
@@ -74,9 +78,9 @@ void audio_play(enum asset_id id, float vol) {
     voices[slot].active = 1;
 }
 
-/* Soft-clip: linear below +/-20000, compressed above, ceiling at +/-31000.
-   Prevents the hard distortion that happened when the flap and pipe
-   sounds summed above the s16 range. */
+/* Soft-clip: linear below ±20000, compressed above, ceiling at ±31000.
+   Prevents the hard distortion that happens when two voices sum above
+   the s16 range (e.g. flap + pipe-score at the same instant). */
 static inline int soft_clip(int s) {
     if (s >  31000) return  31000;
     if (s < -31000) return -31000;
