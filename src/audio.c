@@ -3,7 +3,7 @@
 
 extern const u8 asset_blob[];
 
-#define NUM_VOICES 8
+#define NUM_VOICES 16
 #define GRAIN 1024
 
 struct voice {
@@ -26,13 +26,14 @@ int audio_init(s32 h, void *fn, void *G) {
     gadget = G;
     for (int i = 0; i < NUM_VOICES; i++) voices[i].active = 0;
 
-    /* Prime the audio device with one silent buffer so the first real
-       sceAudioOutOutput() in the loop doesn't stall for hundreds of
-       milliseconds while the hardware finishes spinning up. */
+    /* Prime the audio device with 3 silent buffers so the pipeline
+       is full when the first sound is requested.  This eliminates the
+       "first sound stutters/cuts" symptom. */
     if (h >= 0 && fn) {
         static s16 silence[GRAIN * 2];
         for (int i = 0; i < GRAIN * 2; i++) silence[i] = 0;
-        NC(G, fn, (u64)h, (u64)silence, 0, 0, 0, 0);
+        for (int k = 0; k < 3; k++)
+            NC(G, fn, (u64)h, (u64)silence, 0, 0, 0, 0);
     }
     return h >= 0 ? 0 : -1;
 }
@@ -48,15 +49,17 @@ void audio_play(enum asset_id id, float vol) {
     const struct asset *a = &asset_table[id];
     if (a->fmt != ASSET_FMT_S16_MONO_48K) return;
 
-    /* Prefer a free voice.  If none, steal the oldest. */
+    /* Prefer a free voice.  If none, steal the OLDEST (largest pos),
+       NOT the newest.  Stealing the newest was cutting fresh sounds
+       off mid-playback — that was the pipe-passing "cutting" bug. */
     int slot = -1;
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!voices[i].active) { slot = i; break; }
     }
     if (slot < 0) {
-        u32 best = 0xFFFFFFFFu;
+        u32 oldest = 0;
         for (int i = 0; i < NUM_VOICES; i++) {
-            if (voices[i].pos < best) { best = voices[i].pos; slot = i; }
+            if (voices[i].pos > oldest) { oldest = voices[i].pos; slot = i; }
         }
     }
     if (slot < 0) return;
