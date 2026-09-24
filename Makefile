@@ -10,7 +10,7 @@ CFLAGS := -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
           -Os -Wall -Wextra -Wno-unused-parameter \
           -I src
 
-LDFLAGS := -T linker.ld -nostdlib -static -no-pie
+LDFLAGS := -T linker.ld -nostdlib -static -no-pie -Wl,--emit-relocs
 
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:src/%.c=build/%.o)
@@ -31,8 +31,6 @@ ifeq ($(wildcard $(ASSET_SCRIPT)),)
 $(error $(ASSET_SCRIPT) not found.  Check with: git ls-files tools/)
 endif
 
-# Stamp-file approach: bake script runs once, produces all three files,
-# and we touch a stamp so make knows the outputs are current.
 src/.assets.stamp: $(ASSET_SCRIPT) \
                    $(wildcard assets/*.png) $(wildcard assets/*.wav)
 	@mkdir -p src
@@ -61,7 +59,6 @@ $(TARGET_BIN): $(TARGET_ELF)
 	@printf "  elf: %8d bytes\n" $$(stat -c%s $(TARGET_ELF) 2>/dev/null || stat -f%z $(TARGET_ELF))
 	@printf "  bin: %8d bytes\n" $$(stat -c%s $(TARGET_BIN) 2>/dev/null || stat -f%z $(TARGET_BIN))
 
-# Real file rule for flappy.hex.  hex: is a thin phony wrapper for convenience.
 $(TARGET_HEX): $(TARGET_BIN)
 	@xxd -p $(TARGET_BIN) | tr -d '\n' > $@
 	@printf "  hex: %8d bytes\n" $$(stat -c%s $(TARGET_HEX) 2>/dev/null || stat -f%z $(TARGET_HEX))
