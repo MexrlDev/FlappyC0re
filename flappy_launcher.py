@@ -2,14 +2,14 @@
 """Flappy Bird PS5 launcher (mirrors the Doom-PS pattern)."""
 import argparse, datetime, os, platform, re, socket, sys, threading, time
 
-DEFAULT_PS5_IP    = ""                              # fill in
-DEFAULT_LAUNCHER  = "flappy.lua"
-DEFAULT_SHELLCODE = "flappy.bin"
-PAYLOAD_PORT      = 9026
-LOG_PORT          = 9027
-SC_PORT_LO        = 5001
-SC_PORT_HI        = 5021
-CHUNK             = 64 * 1024
+DEFAULT_PS4_PS5_IP = ""                             # fill in
+DEFAULT_LAUNCHER   = "flappy.lua"
+DEFAULT_SHELLCODE  = "flappy.bin"
+PAYLOAD_PORT       = 9026
+LOG_PORT           = 9027
+SC_PORT_LO         = 5001
+SC_PORT_HI         = 5021
+CHUNK              = 64 * 1024
 
 IS_WINDOWS = os.name == "nt"
 OS_NAME    = platform.system() or "Unknown"
@@ -163,7 +163,7 @@ def stream_shellcode(host, path, timeout=25, retries=3):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("host", nargs="?", default=DEFAULT_PS5_IP)
+    ap.add_argument("host", nargs="?", default=DEFAULT_PS4_PS5_IP)
     ap.add_argument("--launcher",  "-l", default=DEFAULT_LAUNCHER)
     ap.add_argument("--shellcode", "-s", default=DEFAULT_SHELLCODE)
     ap.add_argument("--debug-logs", type=str_to_bool, default=True,
