@@ -6,7 +6,7 @@ PY     := python3
 
 CFLAGS := -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
           -fno-asynchronous-unwind-tables -fno-unwind-tables \
-          -fno-pic -fno-pie -mno-red-zone \
+          -fno-pic -fno-pie -mno-red-zone -mcmodel=large \
           -Os -Wall -Wextra -Wno-unused-parameter \
           -I src
 
