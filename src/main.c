@@ -35,6 +35,7 @@ PERSIST static void *g_aud_mod      = 0;
 
 PERSIST static u32 g_audio_next_try = 0;
 PERSIST static u32 g_audio_last_log = 0;
+PERSIST static u32 g_audio_sweep_at = 0;
 PERSIST static int g_audio_attempts = 0;
 
 PERSIST static s32 g_pad_mod = -1;
@@ -384,11 +385,11 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-/* VOICE (2) is the only port that reliably routes to the current
-   OS-selected output on retail firmware.  PERSONAL (3) opens but
-   produces silence on many firmwares, so we refuse it. */
 #define PORT_VOICE 2
 
+/* Wider sweep: 255 handles per prefix instead of 64.  The previous
+   session's handle can survive for a while after an unclean exit, and
+   closing it from here forces the kernel to release the port. */
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
     int released = 0;
@@ -399,7 +400,7 @@ static int audio_sweep_stale_handles(void) {
         0x20030000ULL,
     };
     for (int p = 0; p < 4; p++) {
-        for (u64 i = 1; i <= 0x40; i++) {
+        for (u64 i = 1; i <= 0xFF; i++) {
             u64 h = prefixes[p] | i;
             s32 r = (s32)NC(G, g_aud_close_fn, h, 0,0,0,0,0);
             if (r == 0) released++;
@@ -434,23 +435,42 @@ static void audio_init_from(void) {
         return;
     }
 
+    /* First sweep: close any handles a previous session left behind. */
     int released = audio_sweep_stale_handles();
-    printf("audio: released %d stale handles\n", released);
-    if (released > 0) sleep_ms(1500);
+    printf("audio: sweep pass 1 released %d\n", released);
 
-    /* Give VOICE up to ~8 seconds at startup (kernel releases prior
-       sessions within a couple of seconds).  We only ever accept
-       port 2 - if it stays blocked, we let the background retry
-       keep trying rather than falling back to a silent port. */
+    /* Always give the kernel time to release.  Even if the sweep found
+       nothing, a previous session may still be shutting down, or a
+       just-closed handle may need a moment. */
+    sleep_ms(2000);
+
+    /* Second sweep: catches a handle that was still alive during the
+       first sweep but got released during the 2s wait. */
+    released = audio_sweep_stale_handles();
+    printf("audio: sweep pass 2 released %d\n", released);
+    if (released > 0) sleep_ms(800);
+
+    /* Now try VOICE for up to 8 seconds.  Re-sweep periodically in case
+       a stale handle is still being held by a lingering thread. */
     s32 h = -1;
     u32 deadline = now_ms() + 8000;
     int attempt = 0;
+    g_audio_sweep_at = now_ms() + 3000;
     while (now_ms() < deadline && h < 0) {
         h = audio_try_voice();
         if (h < 0) {
-            if ((attempt & 3) == 0) {
+            if ((attempt & 7) == 0) {
                 printf("audio: VOICE busy (0x%08x), waiting...\n",
                        (unsigned)h);
+            }
+            /* Re-sweep every ~3 seconds. */
+            if (now_ms() >= g_audio_sweep_at) {
+                g_audio_sweep_at = now_ms() + 3000;
+                int r2 = audio_sweep_stale_handles();
+                if (r2 > 0) {
+                    printf("audio: mid-wait sweep released %d\n", r2);
+                    sleep_ms(500);
+                }
             }
             sleep_ms(250);
             attempt++;
@@ -459,7 +479,7 @@ static void audio_init_from(void) {
 
     if (h < 0) {
         printf("audio: VOICE unavailable, retrying in background\n");
-        g_audio_next_try = now_ms() + 1000;
+        g_audio_next_try = now_ms() + 1500;
         return;
     }
 
@@ -468,7 +488,8 @@ static void audio_init_from(void) {
     audio_init(h, g_aud_out_fn, G);
 }
 
-/* Background retry.  Only tries port 2.  Never gives up. */
+/* Background retry.  Only tries port 2.  Never gives up.  Sweeps
+   periodically in case a stale handle is still around. */
 static void audio_tick(void) {
     if (g_aud_handle >= 0) return;
 
@@ -484,12 +505,14 @@ static void audio_tick(void) {
         g_aud_handle = h;
         audio_init(h, g_aud_out_fn, G);
         g_audio_attempts = 0;
-    } else if (now - g_audio_last_log > 5000) {
-        g_audio_last_log = now;
-        printf("audio: waiting for VOICE (attempt %d, 0x%08x)\n",
-               g_audio_attempts, (unsigned)h);
-        /* Sweep again in case a leaked handle is in our range. */
-        audio_sweep_stale_handles();
+    } else {
+        /* Every 5 seconds, log and re-sweep. */
+        if (now >= g_audio_sweep_at) {
+            g_audio_sweep_at = now + 5000;
+            int r2 = audio_sweep_stale_handles();
+            printf("audio: waiting for VOICE (attempt %d, 0x%08x, swept %d)\n",
+                   g_audio_attempts, (unsigned)h, r2);
+        }
     }
 }
 
@@ -560,19 +583,6 @@ static void reset_settings_to_default(void) {
     printf("reset: done high=%d\n", game.high_score);
 }
 
-/* ---------------- menu layout ----------------
-   0  START GAME
-   1  DIFFICULTY
-   2  BACKGROUND
-   3  VIBRATION
-   4  SFX
-   5  SCREEN
-   6  RESET SCORE
-   7  SAVE STATUS
-   8  RESET SETTINGS
-   9  CREDITS
-   10 EXIT
-*/
 #define MENU_COUNT 11
 
 static const char *menu_items[] = {
@@ -907,34 +917,51 @@ static void *audio_thread_entry(void *arg) {
     return 0;
 }
 
+/* Clean up before returning to Lua.  Makes sure VOICE is released so a
+   new session can open it immediately.  Order matters: stop the audio
+   thread, close the handle, sweep aggressively, then wait long enough
+   for the kernel to fully release. */
 static void cleanup_and_return(struct ext_args_lua *ext) {
+    /* 1. Stop the audio thread.  Give it real time to finish whatever
+       sceAudioOutOutput it's currently blocked in. */
     g_audio_running = 0;
-    sleep_ms(100);
+    g_audio_pause   = 1;
+    sleep_ms(500);
 
     void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
     if (cancel && g_audio_tid) {
         NC(G, cancel, g_audio_tid, 0, 0, 0, 0, 0);
-        sleep_ms(30);
+        sleep_ms(100);
     }
     g_audio_tid = 0;
 
+    /* 2. Silence the pad. */
     if (pad_h >= 0 && pad_vib_fn) {
         vib_data[0] = 0; vib_data[1] = 0;
         for (int i = 2; i < 8; i++) vib_data[i] = 0;
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
     }
 
+    /* 3. Restore lightbar. */
     lightbar_apply(LB_DEFAULT);
     sleep_ms(80);
 
+    /* 4. Tell the audio subsystem to stop, then close the handle. */
     audio_shutdown();
     if (g_aud_close_fn && g_aud_handle >= 0) {
-        NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
+        s32 r = (s32)NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
+        printf("audio: cleanup close %d -> %d\n", g_aud_handle, r);
         g_aud_handle = -1;
     }
-    audio_sweep_stale_handles();
 
-    sleep_ms(2000);
+    /* 5. Sweep.  This closes any handle we might have missed (e.g. if
+       our close returned an error, or a session state got confused). */
+    int released = audio_sweep_stale_handles();
+    printf("audio: cleanup sweep released %d\n", released);
+
+    /* 6. Long wait: give the kernel time to fully free the port before
+       the next session tries to grab it. */
+    sleep_ms(2500);
 
     if (fbs_mem) {
         u32 *fb0 = (u32*)fbs_mem;
@@ -973,6 +1000,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_mod           = 0;
     g_audio_next_try    = 0;
     g_audio_last_log    = 0;
+    g_audio_sweep_at    = 0;
     g_audio_attempts    = 0;
     g_pad_mod           = -1;
     g_pad_fails         = 0;
