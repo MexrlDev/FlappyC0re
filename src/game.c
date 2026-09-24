@@ -1,226 +1,852 @@
 /* SPDX-License-Identifier: MIT */
-#include "game.h"
+#include "core.h"
+#include "ps_libc.h"
+#include "assets.h"
 #include "render.h"
+#include "game.h"
 #include "audio.h"
+#include "save.h"
 
-#define GRAVITY      (0.5f * 60.0f * 60.0f)   /* 1800 px/sec^2  (was 30) */
-#define JUMP_FORCE   (-10.0f * 60.0f)         /* -600 px/sec               */
+struct ext_args_lua {
+    u64 status;
+    u64 step;
+    u32 frame;
+    u32 pad;
+    s32 log_fd;
+    s32 pad2;
+    u8  log_sa[16];
+    u64 tcp_srv;
+    u64 wad_port;
+    u64 user_id;
+};
 
-#define BIRD_X        BIRD_X_POS
-#define BIRD_W_F      ((float)BIRD_W)
-#define BIRD_H_F      ((float)BIRD_H)
-#define GROUND_H_F    ((float)GROUND_H)
-#define SCREEN_H_F    1080.0f
+PERSIST static void *G, *D;
+PERSIST static s32 g_user_id = 1;
+PERSIST static volatile int g_exit_now = 0;
 
-#define MAX_RAMP_SPEED 12.0f
-#define RAMP_STEP      0.25f
+/* ---------------- early diagnostic ---------------- */
 
-const char *game_diff_name(enum diff d) {
-    switch (d) {
-    case DIFF_EASY:   return "EASY";
-    case DIFF_NORMAL: return "NORMAL";
-    case DIFF_HARD:   return "HARD";
-    case DIFF_RACER:  return "RACER";
-    default:          break;
-    }
-    return "?";
+static void early_send(u64 eboot, void *dlsym, s32 log_fd,
+                       const u8 *log_sa, const char *msg, int msg_len)
+{
+    if (log_fd < 0 || !log_sa) return;
+
+    char sname[8];
+    sname[0]='s'; sname[1]='e'; sname[2]='n'; sname[3]='d';
+    sname[4]='t'; sname[5]='o'; sname[6]=0; sname[7]=0;
+
+    void *sendto_fn = 0;
+    void *g = (void*)(eboot + GADGET_OFFSET);
+    native_call(g, dlsym, (u64)LIBKERNEL_HANDLE, (u64)sname,
+                (u64)&sendto_fn, 0, 0, 0);
+
+    if (sendto_fn)
+        native_call(g, sendto_fn, (u64)log_fd, (u64)msg,
+                    (u64)msg_len, 0, (u64)log_sa, 16);
 }
 
-float game_diff_pipe_speed(enum diff d) {
-    switch (d) {
-    case DIFF_EASY:   return 4.0f;
-    case DIFF_NORMAL: return 5.0f;
-    case DIFF_HARD:   return 7.0f;
-    case DIFF_RACER:  return 5.0f;
-    default:          break;
+static void early_send_hexnum(u64 eboot, void *dlsym, s32 log_fd,
+                              const u8 *log_sa, const char *prefix,
+                              u64 value)
+{
+    char buf[64];
+    int p = 0;
+    while (*prefix && p < 40) buf[p++] = *prefix++;
+
+    char tmp[20]; int t = 0;
+    if (value == 0) tmp[t++] = '0';
+    while (value > 0) {
+        int digit = (int)(value & 0xF);
+        tmp[t++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+        value >>= 4;
     }
-    return 5.0f;
+    while (t > 0) buf[p++] = tmp[--t];
+    buf[p++] = '\n';
+    early_send(eboot, dlsym, log_fd, log_sa, buf, p);
 }
 
-float game_diff_pipe_gap(enum diff d) {
-    switch (d) {
-    case DIFF_EASY:   return 380.0f;
-    case DIFF_NORMAL: return 300.0f;
-    case DIFF_HARD:   return 240.0f;
-    case DIFF_RACER:  return 300.0f;
-    default:          break;
+/* ---------------- ELF relocations ---------------- */
+
+typedef struct {
+    u64 r_offset;
+    u64 r_info;
+    s64 r_addend;
+} Elf64_Rela;
+
+#define R_X86_64_64       1
+#define R_X86_64_RELATIVE 8
+
+static int apply_relocations(void) {
+    u64 rs, re, base;
+    __asm__ volatile("lea __rela_start(%%rip), %0" : "=r"(rs));
+    __asm__ volatile("lea __rela_end(%%rip),   %0" : "=r"(re));
+    __asm__ volatile("lea _start(%%rip),       %0" : "=r"(base));
+
+    if (re <= rs) return 0;
+
+    int count = 0;
+    for (Elf64_Rela *r = (Elf64_Rela*)rs; (u64)r < re; r++) {
+        u32 type = (u32)(r->r_info & 0xFFFFFFFFu);
+        u64 *slot = (u64 *)(base + r->r_offset);
+
+        if (type == R_X86_64_RELATIVE) {
+            *slot = base + (u64)r->r_addend;
+            count++;
+        } else if (type == R_X86_64_64) {
+            *slot += base;
+            count++;
+        }
     }
-    return 300.0f;
+    return count;
 }
 
-static void release(struct game *g, struct pipe_pair *p) {
-    p->active = 0; p->passed = 0; p->x = -9999.0f;
-    for (int i = 0; i < g->active_count; i++) {
-        if (g->active[i] == p) {
-            g->active[i] = g->active[--g->active_count];
-            return;
+/* ---------------- video ---------------- */
+
+PERSIST static s32 video_h = -1;
+PERSIST static void *vid_flip, *vid_open, *vid_close, *vid_reg, *vid_rate, *vid_evt;
+PERSIST static u64 eq;
+PERSIST static void *wait_eq, *create_eq, *delete_eq;
+PERSIST static u8 *fbs_mem;
+PERSIST static u64 start_us;
+PERSIST static void *get_proc_time;
+PERSIST static u64 total_frames;
+
+/* ---------------- pad ---------------- */
+
+PERSIST static s32 pad_h = -1;
+PERSIST static void *pad_read_fn;
+PERSIST static void *pad_vib_fn;
+PERSIST static void *pad_lb_fn;
+PERSIST static u8 pad_buf[128];
+PERSIST static u32 pad_prev;
+PERSIST static u8 vib_data[8];
+
+/* ---------------- game ---------------- */
+
+PERSIST static struct game game;
+
+PERSIST static u32 haptic_until_ms;
+PERSIST static u8  haptic_large, haptic_small;
+
+static u32 now_ms(void) {
+    if (!get_proc_time) return (u32)(total_frames * 1000 / 60);
+    u64 t = NC(G, get_proc_time, 0,0,0,0,0,0);
+    return (u32)((t - start_us) / 1000);
+}
+
+static void sleep_ms(u32 ms) {
+    static void *usleep;
+    if (!usleep) usleep = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelUsleep");
+    if (usleep) NC(G, usleep, (u64)ms * 1000, 0,0,0,0,0);
+}
+
+#define DS_CROSS    0x00004000u
+#define DS_CIRCLE   0x00002000u
+#define DS_TRIANGLE 0x00001000u
+#define DS_SQUARE   0x00008000u
+#define DS_UP       0x00000010u
+#define DS_DOWN     0x00000040u
+#define DS_LEFT     0x00000080u
+#define DS_RIGHT    0x00000020u
+#define DS_OPTIONS  0x00000008u
+
+static u32 read_pad(void) {
+    if (pad_h < 0 || !pad_read_fn) return 0;
+    for (int i = 0; i < 128; i++) pad_buf[i] = 0;
+    s32 r = (s32)NC(G, pad_read_fn, (u64)pad_h, (u64)pad_buf, 1, 0, 0, 0);
+    if (r <= 0) return 0;
+    u32 raw = *(u32*)pad_buf;
+    if (raw & 0x80000000u) return 0;
+    return raw & 0x001FFFFFu;
+}
+
+static u32 pad_pressed(void) {
+    u32 cur = read_pad();
+    u32 p = cur & ~pad_prev;
+    pad_prev = cur;
+    return p;
+}
+
+/* ---------------- lightbar ---------------- */
+
+static void lightbar(u8 r, u8 g, u8 b) {
+    if (pad_h < 0 || !pad_lb_fn) return;
+    struct { u8 r, g, b, x; } col;
+    col.r = r; col.g = g; col.b = b; col.x = 0;
+    NC(G, pad_lb_fn, (u64)pad_h, (u64)&col, 0,0,0,0);
+}
+
+static const u32 LB_MENU    = 0xFFDC00u;
+static const u32 LB_PLAYING = 0xFFDC00u;
+static const u32 LB_DEAD    = 0xFF0000u;
+static const u32 LB_DEFAULT = 0x0000C8u;
+
+static void lightbar_apply(u32 rgb) {
+    lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
+/* ---------------- haptics ---------------- */
+
+static void haptic_raw(u8 large, u8 small) {
+    haptic_large = large;
+    haptic_small = small;
+    if (!game.vibration_on) {
+        if (pad_h >= 0 && pad_vib_fn) {
+            vib_data[0] = 0; vib_data[1] = 0;
+            for (int i = 2; i < 8; i++) vib_data[i] = 0;
+            NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+        }
+        return;
+    }
+    if (pad_h < 0 || !pad_vib_fn) return;
+    vib_data[0] = large;
+    vib_data[1] = small;
+    for (int i = 2; i < 8; i++) vib_data[i] = 0;
+    NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+}
+
+static void haptic_low_pulse(void) { haptic_raw(80, 80);   haptic_until_ms = now_ms() + 40;   }
+static void haptic_death(void)     { haptic_raw(255, 255); haptic_until_ms = now_ms() + 1000; }
+static void haptic_restart(void)   { haptic_raw(128, 128); haptic_until_ms = now_ms() + 200;  }
+
+static void haptic_tick(void) {
+    if (haptic_until_ms && now_ms() >= haptic_until_ms) {
+        haptic_until_ms = 0;
+        haptic_raw(0, 0);
+    }
+}
+
+static void haptic_apply_toggle(void) {
+    if (!game.vibration_on) {
+        haptic_until_ms = 0;
+        if (pad_h >= 0 && pad_vib_fn) {
+            vib_data[0] = 0; vib_data[1] = 0;
+            for (int i = 2; i < 8; i++) vib_data[i] = 0;
+            NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
         }
     }
 }
 
-static struct pipe_pair *obtain(struct game *g) {
-    for (int i = 0; i < POOL_PAIRS; i++)
-        if (!g->pool[i].active) return &g->pool[i];
-    return &g->pool[0];
-}
+/* ---------------- present / video init ---------------- */
 
-/* Persistent LCG — advances every spawn so runs differ. */
-static u32 s_rng = 0x13579BDFu;
-static u32 rng_next(void) {
-    s_rng = s_rng * 1103515245u + 12345u;
-    return s_rng >> 16;
-}
-
-static void spawn_pipe(struct game *g) {
-    float min_gap_y = g->pipe_gap;
-    float max_gap_y = SCREEN_H_F - GROUND_H_F - g->pipe_gap - 10.0f;
-    float t = (float)(rng_next() & 0x7FFF) / 32768.0f;
-    float gy = min_gap_y + t * (max_gap_y - min_gap_y);
-
-    struct pipe_pair *p = obtain(g);
-    p->active  = 1;
-    p->passed  = 0;
-    p->x       = 1920.0f;
-    p->y_top   = gy - g->pipe_gap;   /* bottom of top pipe / top of gap */
-    p->y_bot   = gy;                 /* top of bottom pipe               */
-    g->active[g->active_count++] = p;
-}
-
-void game_init(struct game *g) {
-    for (int i = 0; i < POOL_PAIRS; i++) {
-        g->pool[i].active = 0;
-        g->pool[i].x = -9999.0f;
+static void present(void) {
+    NC(G, vid_flip, (u64)video_h, (u64)(total_frames & 1), 1,
+       (u64)total_frames, 0, 0);
+    if (eq && wait_eq) {
+        u8 evt[64]; s32 n = 0;
+        NC(G, wait_eq, eq, (u64)evt, 1, (u64)&n, 0, 0);
+    } else {
+        sleep_ms(16);
     }
-    g->active_count = 0;
-    g->state = GS_MENU;
-    g->menu_cursor = 0;
-    g->show_credits = 0;
-    g->vibration_on = 1;
-    game_set_diff(g, DIFF_NORMAL);
-    g->is_night = 0;
-    g->score = 0;
-    g->last_score = 0;
-    g->high_score = 0;
-    g->lifetime_pipes = 0;
-    s_rng = 0x13579BDFu ^ (u32)(g->lifetime_pipes + 1);
+    render_swap();
+    total_frames++;
 }
 
-void game_set_diff(struct game *g, enum diff d) {
-    g->diff = d;
-    g->pipe_speed = game_diff_pipe_speed(d);
-    g->pipe_gap   = game_diff_pipe_gap(d);
+static int video_init(u64 eboot) {
+    void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
+    if (cancel) {
+        u64 gs = *(u64*)(eboot + EBOOT_GS_THREAD);
+        if (gs) NC(G, cancel, gs, 0,0,0,0,0);
+    }
+    sleep_ms(300);
+
+    s32 vmod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
+                       (u64)"libSceVideoOut.sprx", 0,0,0,0,0);
+    vid_open  = SYM(G, D, vmod, "sceVideoOutOpen");
+    vid_close = SYM(G, D, vmod, "sceVideoOutClose");
+    vid_reg   = SYM(G, D, vmod, "sceVideoOutRegisterBuffers");
+    vid_flip  = SYM(G, D, vmod, "sceVideoOutSubmitFlip");
+    vid_rate  = SYM(G, D, vmod, "sceVideoOutSetFlipRate");
+    vid_evt   = SYM(G, D, vmod, "sceVideoOutAddFlipEvent");
+    if (!vid_open) return -1;
+
+    s32 emu_vid = *(s32*)(eboot + EBOOT_VIDOUT);
+    if (vid_close && emu_vid >= 0) NC(G, vid_close, (u64)emu_vid, 0,0,0,0,0);
+    sleep_ms(100);
+
+    video_h = (s32)NC(G, vid_open, 0xFF, 0, 0, 0, 0, 0);
+    if (video_h < 0) return -2;
+
+    void *alloc_dm = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelAllocateDirectMemory");
+    void *map_dm   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMapDirectMemory");
+    void *dm_size  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetDirectMemorySize");
+    create_eq      = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelCreateEqueue");
+    wait_eq        = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWaitEqueue");
+    delete_eq      = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelDeleteEqueue");
+
+    if (create_eq) NC(G, create_eq, (u64)&eq, (u64)"flapQ", 0,0,0,0);
+    if (vid_evt && eq) NC(G, vid_evt, eq, (u64)video_h, 0,0,0,0);
+
+    u64 total = dm_size ? NC(G, dm_size, 0,0,0,0,0,0) : 0x300000000ULL;
+    u64 phys = 0;
+    NC(G, alloc_dm, 0, total, FB_TOTAL, 0x200000, 3, (u64)&phys);
+    void *vmem = 0;
+    NC(G, map_dm, (u64)&vmem, FB_TOTAL, 0x33, 0, phys, 0x200000);
+    if (!vmem) return -3;
+    fbs_mem = vmem;
+
+    u8 attr[64] = {0};
+    *(u32*)(attr+0)  = 0x80000000;
+    *(u32*)(attr+4)  = 1;
+    *(u32*)(attr+12) = SCR_W;
+    *(u32*)(attr+16) = SCR_H;
+    *(u32*)(attr+20) = SCR_W;
+    void *rbs[2] = { fbs_mem, fbs_mem + FB_ALIGNED };
+    if (NC(G, vid_reg, (u64)video_h, 0, (u64)rbs, 2, (u64)attr, 0) != 0)
+        return -4;
+    if (vid_rate) NC(G, vid_rate, (u64)video_h, 0, 0,0,0,0);
+
+    render_init((u32*)rbs[0], (u32*)rbs[1]);
+    return 0;
 }
 
-void game_reset_run(struct game *g) {
-    g->bird_y = SCREEN_H_F / 2.0f;
-    g->bird_vy = 0.0f;
-    g->pipe_speed = game_diff_pipe_speed(g->diff);
-    g->pipe_gap   = game_diff_pipe_gap(g->diff);
-    g->pipe_spawn_acc = 0.0f;
-    g->pipe_step  = 500.0f;
-    g->score = 0;
-    g->bg_scroll = 0.0f;
-    g->base_scroll = 0.0f;
-    for (int i = g->active_count - 1; i >= 0; i--)
-        release(g, g->active[i]);
-    g->active_count = 0;
-    s_rng = 0x13579BDFu ^ (u32)(g->lifetime_pipes + 1);
-}
+/* ---------------- user id + audio + pad init ---------------- */
 
-void game_start(struct game *g) {
-    game_reset_run(g);
-    g->state = GS_READY;
-}
+static void query_real_user_id(void) {
+    void *load_mod = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLoadStartModule");
+    if (!load_mod) { printf("query_uid: no load_mod\n"); return; }
 
-void game_jump(struct game *g) {
-    if (g->state == GS_READY) {
-        g->state = GS_PLAYING;
-        g->bird_vy = JUMP_FORCE;
-        audio_play(A_SFX_JUMP, 0.6f);
-    } else if (g->state == GS_PLAYING) {
-        g->bird_vy = JUMP_FORCE;
-        audio_play(A_SFX_JUMP, 0.6f);
+    s32 usr_mod = (s32)NC(G, load_mod, (u64)"libSceUserService.sprx",
+                          0,0,0,0,0);
+    if (usr_mod < 0) { printf("query_uid: load usr_mod failed %d\n", usr_mod); return; }
+
+    void *get_init = SYM(G, D, usr_mod, "sceUserServiceGetInitialUser");
+    void *get_fg   = SYM(G, D, usr_mod, "sceUserServiceGetForegroundUser");
+
+    printf("query_uid: init=%p fg=%p\n", (void*)get_init, (void*)get_fg);
+
+    s32 uid = 0;
+    if (get_init) {
+        s32 r = (s32)NC(G, get_init, (u64)&uid, 0,0,0,0,0);
+        printf("query_uid: GetInitialUser ret=%d uid=%d\n", r, uid);
+        if (r == 0 && uid > 0) { g_user_id = uid; return; }
+    }
+    if (get_fg) {
+        uid = 0;
+        s32 r = (s32)NC(G, get_fg, (u64)&uid, 0,0,0,0,0);
+        printf("query_uid: GetForegroundUser ret=%d uid=%d\n", r, uid);
+        if (r == 0 && uid > 0) { g_user_id = uid; return; }
     }
 }
 
-void game_over(struct game *g) {
-    g->state = GS_GAMEOVER;
-    if (g->score > g->last_score)  g->last_score = g->score;
-    if (g->score > g->high_score)  g->high_score = g->score;
-    audio_play(A_SFX_HIT, 0.8f);
+static void audio_init_from(void) {
+    s32 amod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
+                       (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
+    if (amod < 0) { printf("audio: load libSceAudioOut failed\n"); return; }
+    void *a_open = SYM(G, D, amod, "sceAudioOutOpen");
+    void *a_out  = SYM(G, D, amod, "sceAudioOutOutput");
+    if (!a_open || !a_out) { printf("audio: syms missing\n"); return; }
+
+    /* Open with 1024-frame buffers (matches GRAIN in audio.c).  This
+       halves the per-submit latency vs. the old 2048. */
+    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
+    if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 512, SAMPLE_RATE, AUDIO_S16_STEREO);
+    if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 256, SAMPLE_RATE, AUDIO_S16_STEREO);
+    if (h < 0) { printf("audio: open failed %d\n", h); return; }
+
+    printf("audio: handle=%d\n", h);
+    audio_init(h, a_out, G);
 }
 
-static void update_pipes(struct game *g, float dt) {
-    for (int i = g->active_count - 1; i >= 0; i--) {
-        struct pipe_pair *p = g->active[i];
-        p->x -= g->pipe_speed * 60.0f * dt;
+static void pad_init_from(void) {
+    s32 pmod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
+                       (u64)"libScePad.sprx", 0,0,0,0,0);
+    if (pmod < 0) { printf("pad_init: load libScePad failed %d\n", pmod); return; }
 
-        if (!p->passed && p->x + (float)PIPE_W < BIRD_X) {
-            p->passed = 1;
-            g->score++;
-            g->lifetime_pipes++;
-            if (g->diff == DIFF_RACER && g->pipe_speed < MAX_RAMP_SPEED)
-                g->pipe_speed += RAMP_STEP;
-            else if (g->diff == DIFF_HARD && g->pipe_speed < 10.0f)
-                g->pipe_speed += RAMP_STEP * 0.5f;
-            audio_play(A_SFX_SCORE, 0.5f);
+    void *p_init = SYM(G, D, pmod, "scePadInit");
+    void *p_geth = SYM(G, D, pmod, "scePadGetHandle");
+    pad_read_fn  = SYM(G, D, pmod, "scePadRead");
+    pad_vib_fn   = SYM(G, D, pmod, "scePadSetVibration");
+    pad_lb_fn    = SYM(G, D, pmod, "scePadSetLightBar");
+
+    printf("pad syms: init=%p geth=%p read=%p vib=%p lb=%p\n",
+           (void*)p_init, (void*)p_geth, (void*)pad_read_fn,
+           (void*)pad_vib_fn, (void*)pad_lb_fn);
+
+    if (p_init) NC(G, p_init, 0,0,0,0,0,0);
+
+    if (p_geth) {
+        s32 candidates[6];
+        int n = 0;
+        candidates[n++] = g_user_id;
+        candidates[n++] = 1;
+        candidates[n++] = 0;
+        candidates[n++] = 0xFF;
+        candidates[n++] = 0xFE;
+        candidates[n++] = 0x10000000;
+
+        for (int i = 0; i < n && pad_h < 0; i++) {
+            s32 uid = candidates[i];
+            pad_h = (s32)NC(G, p_geth, (u64)uid, 0, 0, 0, 0, 0);
+            printf("pad try uid=%d -> handle=%d\n", uid, pad_h);
         }
-
-        if (p->x + (float)PIPE_W < -80.0f)
-            release(g, p);
     }
 
-    g->pipe_spawn_acc += g->pipe_speed * 60.0f * dt;
-    if (g->pipe_spawn_acc >= g->pipe_step) {
-        g->pipe_spawn_acc = 0.0f;
-        spawn_pipe(g);
+    printf("pad handle = %d\n", pad_h);
+
+    for (int i = 0; i < 8; i++) vib_data[i] = 0;
+    if (pad_h >= 0 && pad_vib_fn)
+        NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+
+    for (int i = 0; i < 5; i++) {
+        lightbar_apply(LB_MENU);
+        sleep_ms(30);
+    }
+    printf("lightbar set to yellow (pad_h=%d lb=%p)\n",
+           pad_h, (void*)pad_lb_fn);
+}
+
+/* ---------------- menu UI ---------------- */
+
+static const char *menu_items[] = {
+    "START GAME",
+    "DIFFICULTY",
+    "BACKGROUND",
+    "VIBRATION",
+    "RESET SCORE",
+    "SAVE STATUS",
+    "CREDITS",
+    "EXIT",
+};
+#define MENU_COUNT 8
+
+static void draw_credits(void) {
+    render_clear(0xFF0A0A0A);
+    render_text_center(60,  "CREDITS", 0xFFFFC030u, 10);
+
+    render_text_center(160, "PROGRAMMER", 0xFF808080u, 4);
+    render_text_center(210, "MexrlDev",    0xFFFFFFFFu, 6);
+
+    render_text_center(320, "SPECIAL THANKS", 0xFF808080u, 4);
+    render_text_center(370, "Egycnq  -  EmuC0re / DooMC0re", 0xFFD0D0D0u, 4);
+    render_text_center(410, "Gezine  -  LuaC0re",            0xFFD0D0D0u, 4);
+
+    render_text_center(510, "ASSETS", 0xFF808080u, 4);
+    render_text_center(560, "Samuel Custodio (MIT)", 0xFFD0D0D0u, 4);
+
+    render_text_center(880, "X or O to return", 0xFFC0C0C0u, 4);
+}
+
+static void draw_menu(void) {
+    if (game.show_credits) { draw_credits(); return; }
+
+    render_clear(0xFF0A0A0A);
+
+    render_text_center(80,  "FLAPPY BIRD", 0xFF000000u, 10);
+    render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
+    render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
+
+    int base_y = 380;
+    for (int i = 0; i < MENU_COUNT; i++) {
+        char line[64];
+        u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
+        const char *text = menu_items[i];
+        if (i == 1) {
+            snprintf(line, sizeof(line), "DIFFICULTY: %s", game_diff_name(game.diff));
+            text = line;
+        } else if (i == 2) {
+            snprintf(line, sizeof(line), "BACKGROUND: %s", game.is_night ? "NIGHT" : "DAY");
+            text = line;
+        } else if (i == 3) {
+            snprintf(line, sizeof(line), "VIBRATION: %s", game.vibration_on ? "ON" : "OFF");
+            text = line;
+        } else if (i == 4) {
+            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            text = line;
+        } else if (i == 5) {
+            snprintf(line, sizeof(line), "SAVE: %s",
+                     save_available() ? "OK" : "NO SAVEDATA");
+            text = line;
+        }
+        if (i == game.menu_cursor)
+            render_text(160, base_y + i * 60 - 6, ">", col, 4);
+        render_text(240, base_y + i * 60, text, col, 4);
+    }
+
+    render_text(40, 940, "X: SELECT   O: BACK", 0xFF808080u, 3);
+    render_text(SCR_W - 40 - render_text_width("By MexrlDev", 3),
+                940, "By MexrlDev", 0xFF606060u, 3);
+
+    char hi[64];
+    snprintf(hi, sizeof(hi), "HIGH: %d   LIFETIME: %u",
+             game.high_score, game.lifetime_pipes);
+    render_text(40, 990, hi, 0xFF404040u, 3);
+}
+
+/* ---- draw_playing ---- */
+static void draw_playing(void) {
+    int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
+
+    /* Background tiles: enough copies to cover 1920 px.
+       bg_scroll is in [-BG_W, 0]. */
+    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 1;   /* ~4-5 */
+    for (int i = 0; i < bg_copies; i++) {
+        render_blit_scaled_bg_fp(bg, game.bg_scroll + (float)(i * BG_W),
+                                 GAME_SCALE_FP);
+    }
+
+    /* Pipes — top pipe bottom edge sits at p->y_top, bottom pipe top at p->y_bot */
+    for (int i = 0; i < game.active_count; i++) {
+        struct pipe_pair *p = game.active[i];
+        render_blit_scaled_fp(A_PIPE_TOP, p->x, p->y_top - (float)PIPE_H,
+                              GAME_SCALE_FP, 255);
+        render_blit_scaled_fp(A_PIPE_BOT, p->x, p->y_bot,
+                              GAME_SCALE_FP, 255);
+    }
+
+    /* Ground / base tiles */
+    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 1;   /* ~4 */
+    for (int i = 0; i < base_copies; i++) {
+        render_blit_scaled_fp(A_BASE,
+                              game.base_scroll + (float)(i * BASE_W),
+                              (float)(SCR_H - GROUND_H),
+                              GAME_SCALE_FP, 255);
+    }
+
+    /* Bird */
+    int bird_asset = A_BIRD_MID;
+    if (game.bird_vy < -120.0f)      bird_asset = A_BIRD_UP;
+    else if (game.bird_vy > 120.0f)  bird_asset = A_BIRD_DOWN;
+    render_blit_scaled_fp(bird_asset, BIRD_X_POS, game.bird_y,
+                          GAME_SCALE_FP, 255);
+
+    /* Score text */
+    char s[32];
+    snprintf(s, sizeof(s), "SCORE: %d", game.score);
+    render_text(40, 40, s, 0xFFFFFFFFu, 5);
+    snprintf(s, sizeof(s), "BEST: %d", game.high_score);
+    render_text(40, 100, s, 0xFFFFC030u, 4);
+}
+
+/* ---- draw_gameover ---- */
+static void draw_gameover(void) {
+    /* GAME OVER banner image, centered horizontally at y ≈ 440 */
+    int gx = (SCR_W - GAMEOVER_W) / 2;
+    render_blit_scaled_fp(A_GAMEOVER, (float)gx, (float)(SCR_H / 2 - 100),
+                          384 /* 1.5 * 256 */, 255);
+
+    char s[64];
+    snprintf(s, sizeof(s), "SCORE: %d", game.score);
+    render_text_center(560, s, 0xFFFFFFFFu, 6);
+    snprintf(s, sizeof(s), "BEST: %d", game.high_score);
+    render_text_center(650, s, 0xFFFFC030u, 6);
+    render_text_center(900, "X RESTART   O BACK", 0xFFC0C0C0u, 4);
+}
+
+/* ---- draw_ready ---- */
+static void draw_ready(void) {
+    draw_playing();
+    render_text_center(280, "GET READY",   0xFFFFC030u, 10);
+    render_text_center(400, "X TO JUMP",   0xFFFFFFFFu, 4);
+    render_text_center(1080 - 340, "O TO GO BACK", 0xFF808080u, 3);
+}
+
+/* ---------------- menu logic ---------------- */
+
+static void menu_update(u32 pressed) {
+    if (game.show_credits) {
+        if (pressed & (DS_CROSS | DS_CIRCLE))
+            game.show_credits = 0;
+        return;
+    }
+
+    if (pressed & DS_UP)
+        game.menu_cursor = (game.menu_cursor + MENU_COUNT - 1) % MENU_COUNT;
+    if (pressed & DS_DOWN)
+        game.menu_cursor = (game.menu_cursor + 1) % MENU_COUNT;
+
+    if (pressed & (DS_LEFT | DS_RIGHT)) {
+        int dir = (pressed & DS_RIGHT) ? 1 : -1;
+        if (game.menu_cursor == 1) {
+            int d = (game.diff + DIFF_COUNT + dir) % DIFF_COUNT;
+            game_set_diff(&game, (enum diff)d);
+            save_write(&game);
+        } else if (game.menu_cursor == 2) {
+            game.is_night ^= 1;
+            save_write(&game);
+        } else if (game.menu_cursor == 3) {
+            game.vibration_on ^= 1;
+            haptic_apply_toggle();
+            save_write(&game);
+        }
+    }
+
+    if (pressed & DS_CROSS) {
+        switch (game.menu_cursor) {
+        case 0: game_start(&game); break;
+        case 1:
+            game_set_diff(&game, (enum diff)((game.diff + 1) % DIFF_COUNT));
+            save_write(&game);
+            break;
+        case 2:
+            game.is_night ^= 1;
+            save_write(&game);
+            break;
+        case 3:
+            game.vibration_on ^= 1;
+            haptic_apply_toggle();
+            save_write(&game);
+            break;
+        case 4:
+            game.high_score = 0;
+            game.last_score = 0;
+            save_write(&game);
+            break;
+        case 5:
+            break;
+        case 6:
+            game.show_credits = 1;
+            break;
+        case 7:
+            save_write(&game);
+            g_exit_now = 1;
+            break;
+        }
     }
 }
 
-static int aabb(float ax, float ay, float aw, float ah,
-                float bx, float by, float bw, float bh) {
-    return !(bx > ax + aw || bx + bw < ax || by > ay + ah || by + bh < ay);
-}
+/* ---------------- game loop body ---------------- */
 
-void game_update(struct game *g, float dt) {
-    if (g->state == GS_READY || g->state == GS_PLAYING) {
-        if (g->state == GS_PLAYING) {
-            g->bird_vy += GRAVITY * dt;
+PERSIST static enum gstate last_gstate = 0xFF;
+
+static void game_update_and_draw(u32 pressed, float dt) {
+    if (game.state != last_gstate) {
+        printf("STATE %d -> %d (f=%u)\n",
+               (int)last_gstate, (int)game.state, (unsigned)total_frames);
+        if (game.state == GS_GAMEOVER) {
+            haptic_death();
+            lightbar_apply(LB_DEAD);
+        } else if (game.state == GS_MENU) {
+            lightbar_apply(LB_MENU);
         } else {
-            g->bird_vy = 0.0f;
-            g->bird_y  = SCREEN_H_F / 2.0f;
+            lightbar_apply(LB_PLAYING);
         }
-        g->bird_y += g->bird_vy * dt;
-
-        if (g->bird_y < 0.0f) { g->bird_y = 0.0f; g->bird_vy = 0.0f; }
-        if (g->bird_y + BIRD_H_F > SCREEN_H_F - GROUND_H_F) {
-            g->bird_y = SCREEN_H_F - GROUND_H_F - BIRD_H_F;
-            game_over(g);
-            return;
-        }
+        last_gstate = game.state;
     }
 
-    if (g->state == GS_PLAYING) {
-        update_pipes(g, dt);
+    if (game.state == GS_READY) {
+        game_update(&game, dt);
+        if (pressed & DS_CROSS) { game_jump(&game); haptic_low_pulse(); }
+        if (pressed & DS_CIRCLE) game.state = GS_MENU;
+        draw_ready();
+        return;
+    }
 
-        float bx = BIRD_X, by = g->bird_y;
-        for (int i = 0; i < g->active_count; i++) {
-            struct pipe_pair *p = g->active[i];
-            /* top pipe AABB: (x, y_top - PIPE_H) .. (x + PIPE_W, y_top)     */
-            if (aabb(bx, by, BIRD_W_F, BIRD_H_F,
-                     p->x, p->y_top - (float)PIPE_H, (float)PIPE_W, (float)PIPE_H)
-             || /* bottom pipe AABB: (x, y_bot) .. (x + PIPE_W, y_bot + PIPE_H) */
-                aabb(bx, by, BIRD_W_F, BIRD_H_F,
-                     p->x, p->y_bot, (float)PIPE_W, (float)PIPE_H)) {
-                game_over(g);
-                return;
+    if (game.state == GS_PLAYING) {
+        game_update(&game, dt);
+        if (pressed & DS_CROSS)   { game_jump(&game); haptic_low_pulse(); }
+        if (pressed & DS_OPTIONS) game.state = GS_PAUSED;
+        draw_playing();
+        return;
+    }
+
+    if (game.state == GS_PAUSED) {
+        draw_playing();
+        render_fill_rect(0, 0, SCR_W, SCR_H, 0x80000000u);
+        render_text_center(480, "PAUSED", 0xFFFFFFFFu, 10);
+        render_text_center(620, "X RESUME   O BACK", 0xFFC0C0C0u, 4);
+        if (pressed & DS_CROSS)  game.state = GS_PLAYING;
+        if (pressed & DS_CIRCLE) game.state = GS_MENU;
+        return;
+    }
+
+    if (game.state == GS_GAMEOVER) {
+        draw_playing();
+        render_fill_rect(0, 0, SCR_W, SCR_H, 0xC0000000u);
+        draw_gameover();
+        if (pressed & DS_CROSS) {
+            save_write(&game);
+            haptic_restart();
+            game_start(&game);
+        }
+        if (pressed & DS_CIRCLE) {
+            save_write(&game);
+            game.state = GS_MENU;
+        }
+        return;
+    }
+}
+
+/* ---------------- audio pump ---------------- */
+
+static void audio_pump(void) { audio_mix_tick(); }
+
+static void *audio_thread_entry(void *arg) {
+    (void)arg;
+
+    /* Ask for a higher priority so the renderer can't starve us.
+       Lower numeric value = higher priority in Sony's pthread impl. */
+    void *self_fn = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSelf");
+    void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
+    if (self_fn && setprio) {
+        u64 self = NC(G, self_fn, 0,0,0,0,0,0);
+        if (self) NC(G, setprio, self, 200, 0,0,0,0,0);
+    }
+
+    for (;;) audio_pump();
+    return 0;
+}
+
+/* ---------------- cleanup ---------------- */
+
+static void cleanup_and_return(struct ext_args_lua *ext) {
+    if (pad_h >= 0 && pad_vib_fn) {
+        vib_data[0] = 0; vib_data[1] = 0;
+        for (int i = 2; i < 8; i++) vib_data[i] = 0;
+        NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+    }
+
+    lightbar_apply(LB_DEFAULT);
+    sleep_ms(80);
+
+    audio_shutdown();
+
+    if (fbs_mem) {
+        u32 *fb0 = (u32*)fbs_mem;
+        u32 *fb1 = (u32*)(fbs_mem + FB_ALIGNED);
+        for (int i = 0; i < SCR_W * SCR_H; i++) { fb0[i] = 0xFF000000; fb1[i] = 0xFF000000; }
+        if (vid_flip && video_h >= 0)
+            NC(G, vid_flip, (u64)video_h, 0, 1, 0, 0, 0);
+        sleep_ms(50);
+    }
+
+    if (vid_close && video_h >= 0)
+        NC(G, vid_close, (u64)video_h, 0,0,0,0,0);
+
+    if (delete_eq && eq)
+        NC(G, delete_eq, eq, 0,0,0,0,0);
+
+    ext->status = 0;
+    ext->step   = 99;
+    ext->frame  = (u32)total_frames;
+}
+
+/* ---------------- entry point ---------------- */
+
+__attribute__((section(".text._start")))
+void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
+    int nreloc = apply_relocations();
+
+    G = (void*)(eboot + GADGET_OFFSET);
+    D = dlsym;
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "ENTRY\n", 6);
+    early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
+                      "RELOC ", (u64)nreloc);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "VIDEO\n", 6);
+    if (video_init(eboot) != 0) {
+        early_send(eboot, dlsym, ext->log_fd, ext->log_sa,
+                   "VIDEO FAIL\n", 11);
+        for (;;) sleep_ms(1000);
+    }
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "LIBC\n", 5);
+    ps_libc_init(G, D,
+        SYM(G, D, LIBKERNEL_HANDLE, "mmap"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sceKernelOpen"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sceKernelRead"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWrite"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sceKernelClose"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLseek"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMkdir"),
+        SYM(G, D, LIBKERNEL_HANDLE, "sendto"),
+        ext->log_fd, ext->log_sa);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "UID\n", 4);
+    query_real_user_id();
+    early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
+                      "UIDFINAL ", (u64)g_user_id);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "PAD\n", 4);
+    pad_init_from();
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "AUDIO\n", 6);
+    audio_init_from();
+
+    get_proc_time = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetProcessTime");
+    if (get_proc_time) start_us = NC(G, get_proc_time, 0,0,0,0,0,0);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "SAVE\n", 5);
+    save_init();
+    game_init(&game);
+    game.vibration_on = 1;
+    save_load(&game);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
+
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d\n",
+           nreloc, video_h, pad_h,
+           pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
+           save_available(), (int)g_user_id);
+
+    /* ---- Layout report so you can sanity-check on-device ---- */
+    printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
+           BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
+           BIRD_W, BIRD_H, GROUND_H, GAME_SCALE_FP);
+
+    void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
+    if (pc) {
+        u64 tid = 0;
+        NC(G, pc, (u64)&tid, 0,
+           (u64)(void*)audio_thread_entry, 0, (u64)"flap_aud", 0);
+    }
+
+    pad_prev = read_pad();
+
+    u32 last_ms = now_ms();
+    u32 prev_raw_logged = 0;
+
+    while (!g_exit_now) {
+        u32 cur_ms = now_ms();
+        u32 dt_ms = cur_ms - last_ms;
+        if (dt_ms > 50) dt_ms = 50;
+        last_ms = cur_ms;
+        float dt = (float)dt_ms / 1000.0f;
+        if (dt <= 0.0f) dt = 1.0f / 60.0f;
+
+        haptic_tick();
+
+        /* ---- Debug: log every raw pad change ---- */
+        u32 raw = read_pad();
+        if (raw != prev_raw_logged) {
+            printf("PAD f=%u raw=%08x st=%d\n",
+                   (unsigned)total_frames, raw, (int)game.state);
+            prev_raw_logged = raw;
+        }
+
+        /* ---- Debug: frame timing + state for the first ~10 s ---- */
+        {
+            static u32 max_dt_seen = 0;
+            if (dt_ms > max_dt_seen) max_dt_seen = dt_ms;
+            if (total_frames < 600 && (total_frames % 30) == 0) {
+                printf("DBG f=%u st=%d y=%d vy=%d pipes=%d spd=%d sc=%d maxdt=%u\n",
+                       (unsigned)total_frames, (int)game.state,
+                       (int)(game.bird_y * 10.0f),
+                       (int)game.bird_vy,
+                       game.active_count,
+                       (int)(game.pipe_speed * 100.0f),
+                       game.score,
+                       (unsigned)max_dt_seen);
+                max_dt_seen = 0;
             }
         }
+
+        u32 pressed = raw & ~pad_prev;
+        pad_prev = raw;
+
+        if (game.state == GS_MENU) {
+            menu_update(pressed);
+            draw_menu();
+        } else {
+            game_update_and_draw(pressed, dt);
+        }
+
+        present();
+        if (!pc) audio_pump();
     }
 
-    g->bg_scroll   -= (g->pipe_speed / 3.0f) * 60.0f * dt;
-    g->base_scroll -= g->pipe_speed * 60.0f * dt;
-
-    if (g->bg_scroll   < -(float)BG_W)   g->bg_scroll   += (float)BG_W;
-    if (g->base_scroll < -(float)BASE_W) g->base_scroll += (float)BASE_W;
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "EXIT\n", 5);
+    cleanup_and_return(ext);
+    return;
 }
