@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: MIT
-CC     := gcc
-LD     := ld
-OBJCOPY:= objcopy
-PY     := python3
+CC      := gcc
+OBJCOPY := objcopy
+PY      := python3
 
-CFLAGS := -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
+CFLAGS := -m64 -ffreestanding -nostdinc -fPIE \
+          -fno-stack-protector -fno-builtin \
           -fno-asynchronous-unwind-tables -fno-unwind-tables \
-          -fno-pic -fno-pie -mno-red-zone -mcmodel=large \
+          -mno-red-zone -fno-omit-frame-pointer \
           -Os -Wall -Wextra -Wno-unused-parameter \
           -I src
 
-LDFLAGS := -T linker.ld -nostdlib -static -no-pie --emit-relocs
+LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie \
+           -Wl,-T,$(CURDIR)/linker.ld \
+           -Wl,--build-id=none
 
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:src/%.c=build/%.o)
@@ -38,7 +40,6 @@ src/.assets.stamp: $(ASSET_SCRIPT) \
 	@touch $@
 
 $(ASSET_OUTPUTS): src/.assets.stamp
-	@test -f $@ || { rm -f src/.assets.stamp; $(MAKE) src/.assets.stamp; }
 
 assets: $(ASSET_OUTPUTS)
 
@@ -52,7 +53,7 @@ build/assets.o: src/assets.S $(ASSET_OUTPUTS) | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET_ELF): $(OBJ) $(ASM_OBJ) linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJ) $(ASM_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(ASM_OBJ)
 
 $(TARGET_BIN): $(TARGET_ELF)
 	$(OBJCOPY) -O binary $< $@
