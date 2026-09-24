@@ -35,8 +35,16 @@ PERSIST static void *g_aud_mod      = 0;
 
 PERSIST static u8 g_aud_actual_port = 2;
 
-PERSIST static s32 g_pad_mod = -1;
+/* Audio swap state machine (all non-blocking). */
+PERSIST static volatile int g_swap_active = 0;
+PERSIST static u8  g_swap_target   = 2;
+PERSIST static u8  g_swap_old      = 2;
+PERSIST static int g_swap_reverting = 0;
+PERSIST static int g_swap_phase    = 0;  /* 1=close, 2=wait, 3=try */
+PERSIST static u32 g_swap_step_at  = 0;
+PERSIST static u32 g_swap_deadline = 0;
 
+PERSIST static s32 g_pad_mod = -1;
 PERSIST static u32 g_pad_fails = 0;
 
 static void early_send(u64 eboot, void *dlsym, s32 log_fd,
@@ -383,40 +391,6 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-/* Try to open `port` up to `attempts` times, with `delay` ms between
-   attempts.  Tries both the real user id and 0xFF each round. */
-static s32 open_port_retry(u8 port, int attempts, u32 delay) {
-    for (int i = 0; i < attempts; i++) {
-        if (g_user_id > 0) {
-            s32 h = try_open_audio_port(g_user_id, (s32)port);
-            if (h >= 0) return h;
-        }
-        s32 h = try_open_audio_port(0xFF, (s32)port);
-        if (h >= 0) return h;
-        if (i + 1 < attempts) sleep_ms(delay);
-    }
-    return -1;
-}
-
-static int audio_sweep_stale_handles(void) {
-    if (!g_aud_close_fn) return 0;
-    int released = 0;
-    static const u64 prefixes[] = {
-        0x20000000ULL,
-        0x20010000ULL,
-        0x20020000ULL,
-        0x20030000ULL,
-    };
-    for (int p = 0; p < 4; p++) {
-        for (u64 i = 1; i <= 0x40; i++) {
-            u64 h = prefixes[p] | i;
-            s32 r = (s32)NC(G, g_aud_close_fn, h, 0,0,0,0,0);
-            if (r == 0) released++;
-        }
-    }
-    return released;
-}
-
 #define PORT_TV       2
 #define PORT_HEADSET  3
 
@@ -444,25 +418,27 @@ static void audio_init_from(void) {
         return;
     }
 
-    int released = audio_sweep_stale_handles();
-    printf("audio: released %d stale handles\n", released);
-    if (released > 0) sleep_ms(250);
-
     u8 preferred = port_normalize(game.audio_port);
     u8 other     = (preferred == PORT_TV) ? PORT_HEADSET : PORT_TV;
 
     s32 h = -1;
     u8  opened = preferred;
 
-    /* Try preferred port with retries.  The kernel can hold a port for
-       several hundred ms after a previous session closed it, so we
-       retry a few times before falling back. */
-    h = open_port_retry(preferred, 4, 250);
+    /* Startup: 5 quick tries for preferred port. */
+    for (int i = 0; i < 5 && h < 0; i++) {
+        if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)preferred);
+        if (h < 0) h = try_open_audio_port(0xFF, (s32)preferred);
+        if (h < 0 && i < 4) sleep_ms(200);
+    }
     printf("audio: try %s -> %d (0x%08x)\n",
            game_audio_port_name(preferred), h, (unsigned)h);
 
     if (h < 0) {
-        h = open_port_retry(other, 3, 250);
+        for (int i = 0; i < 5 && h < 0; i++) {
+            if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)other);
+            if (h < 0) h = try_open_audio_port(0xFF, (s32)other);
+            if (h < 0 && i < 4) sleep_ms(200);
+        }
         printf("audio: try %s -> %d (0x%08x)\n",
                game_audio_port_name(other), h, (unsigned)h);
         if (h >= 0) opened = other;
@@ -482,96 +458,105 @@ static void audio_init_from(void) {
     g_aud_handle = h;
     audio_init(h, g_aud_out_fn, G);
 
-    /* Persist whatever actually opened so the next session starts on the
-       port that works. */
     save_write(&game);
 }
 
-/* Swap the audio port.  Close first, wait for kernel, then retry the
-   new port.  If new fails, retry old.  If both fail, try the other.
-   Never leaves state corrupted. */
-static void audio_restart_with_port(u8 new_port) {
-    new_port = port_normalize(new_port);
-    if (!g_aud_open_fn || !g_aud_close_fn) return;
+/* Request a swap.  Non-blocking - just sets up state. */
+static void audio_swap_request(u8 target) {
+    if (g_swap_active) return;   /* one at a time */
 
-    if (new_port == g_aud_actual_port && g_aud_handle >= 0) {
-        game.audio_port = new_port;
+    target = port_normalize(target);
+    if (target == g_aud_actual_port && g_aud_handle >= 0) {
+        game.audio_port = target;
         return;
     }
 
-    printf("audio: restart -> %s\n", game_audio_port_name(new_port));
+    printf("audio: swap -> %s\n", game_audio_port_name(target));
 
     g_audio_pause = 1;
-    sleep_ms(60);
 
-    u8 old_port = g_aud_actual_port;
+    g_swap_target   = target;
+    g_swap_old      = g_aud_actual_port;
+    g_swap_reverting = 0;
+    g_swap_phase    = 1;
+    g_swap_step_at  = now_ms();
+    g_swap_deadline = g_swap_step_at + 4000;
 
-    /* Close the current port. */
-    if (g_aud_handle >= 0) {
-        NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
-        g_aud_handle = -1;
-    }
+    game.audio_port = target;
+    save_write(&game);
 
-    /* Sweep any stale handles in case a previous session leaked. */
-    audio_sweep_stale_handles();
+    g_swap_active = 1;
+}
 
-    /* Give the kernel time to release the just-closed port.  This is
-       the key to reliable swapping: without it, both the new port and
-       the reopen of the old port fail with PORT_FULL. */
-    sleep_ms(400);
+/* Non-blocking tick.  Advances the swap state machine. */
+static void audio_swap_tick(void) {
+    if (!g_swap_active) return;
 
-    /* Try the new port. */
-    s32 h = open_port_retry(new_port, 5, 250);
-    if (h >= 0) {
-        g_aud_handle = h;
-        g_aud_actual_port = new_port;
-        game.audio_port = new_port;
-        audio_init(h, g_aud_out_fn, G);
-        printf("audio: switched to %s\n", game_audio_port_name(new_port));
-        save_write(&game);
-        g_audio_pause = 0;
+    u32 now = now_ms();
+
+    /* Phase 1: close the current port once. */
+    if (g_swap_phase == 1) {
+        if (g_aud_handle >= 0) {
+            NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
+            g_aud_handle = -1;
+        }
+        g_swap_step_at = now;
+        g_swap_phase = 2;
         return;
     }
 
-    /* New port failed.  Revert to the old port. */
-    printf("audio: %s busy, reverting to %s\n",
-           game_audio_port_name(new_port),
-           game_audio_port_name(old_port));
-    h = open_port_retry(old_port, 6, 250);
-    if (h >= 0) {
-        g_aud_handle = h;
-        g_aud_actual_port = old_port;
-        game.audio_port = old_port;
-        audio_init(h, g_aud_out_fn, G);
-        printf("audio: still on %s\n", game_audio_port_name(old_port));
-        g_audio_pause = 0;
+    /* Phase 2: wait for kernel to release. */
+    if (g_swap_phase == 2) {
+        if (now - g_swap_step_at < 800) return;
+        g_swap_step_at = now;
+        g_swap_phase = 3;
         return;
     }
 
-    /* Old port also failed.  Try the OTHER port as last resort. */
-    u8 other = (old_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
-    printf("audio: %s also busy, trying %s\n",
-           game_audio_port_name(old_port),
-           game_audio_port_name(other));
-    h = open_port_retry(other, 5, 250);
-    if (h >= 0) {
-        g_aud_handle = h;
-        g_aud_actual_port = other;
-        game.audio_port = other;
-        audio_init(h, g_aud_out_fn, G);
-        printf("audio: using %s\n", game_audio_port_name(other));
-        save_write(&game);
-        g_audio_pause = 0;
+    /* Phase 3: try to open the target (or old, if reverting). */
+    if (g_swap_phase == 3) {
+        if (now - g_swap_step_at < 200) return;
+        g_swap_step_at = now;
+
+        u8 port = g_swap_reverting ? g_swap_old : g_swap_target;
+
+        s32 h = -1;
+        if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)port);
+        if (h < 0) h = try_open_audio_port(0xFF, (s32)port);
+
+        if (h >= 0) {
+            g_aud_handle      = h;
+            g_aud_actual_port = port;
+            game.audio_port   = port;
+            audio_init(h, g_aud_out_fn, G);
+            save_write(&game);
+            printf("audio: switched to %s\n", game_audio_port_name(port));
+            g_audio_pause = 0;
+            g_swap_active = 0;
+            return;
+        }
+
+        /* Timeout? */
+        if (now >= g_swap_deadline) {
+            if (!g_swap_reverting) {
+                printf("audio: %s timed out, reverting to %s\n",
+                       game_audio_port_name(g_swap_target),
+                       game_audio_port_name(g_swap_old));
+                g_swap_reverting = 1;
+                g_swap_deadline  = now + 2000;
+                g_swap_step_at   = now;
+            } else {
+                printf("audio: giving up, staying silent on %s\n",
+                       game_audio_port_name(g_swap_old));
+                game.audio_port   = g_swap_old;
+                g_aud_actual_port = g_swap_old;
+                save_write(&game);
+                g_audio_pause = 0;
+                g_swap_active = 0;
+            }
+        }
         return;
     }
-
-    /* Nothing opened.  Keep the intended port in the menu so the user
-       sees what we tried, but audio is silent for now. */
-    printf("audio: all ports busy - silent\n");
-    g_aud_handle = -1;
-    g_aud_actual_port = old_port;
-    game.audio_port = old_port;
-    g_audio_pause = 0;
 }
 
 static void pad_init_from(void) {
@@ -635,16 +620,13 @@ static void reset_settings_to_default(void) {
     audio_set_master(game.sfx_volume);
     haptic_apply_toggle();
 
-    if (g_aud_actual_port != PORT_TV) {
-        audio_restart_with_port(PORT_TV);
+    if (g_aud_actual_port != PORT_TV || g_aud_handle < 0) {
+        audio_swap_request(PORT_TV);
     } else {
         game.audio_port = PORT_TV;
     }
 
     save_write(&game);
-
-    printf("reset: done, port=%s\n",
-           game_audio_port_name(game.audio_port));
 }
 
 static const char *menu_items[] = {
@@ -834,8 +816,7 @@ static void menu_update(u32 pressed) {
             save_write(&game);
         } else if (game.menu_cursor == 5) {
             u8 next = (game.audio_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
-            audio_restart_with_port(next);
-            save_write(&game);
+            audio_swap_request(next);
         } else if (game.menu_cursor == 6) {
             int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
             game.screen_mode = (enum screen_mode)m;
@@ -866,8 +847,7 @@ static void menu_update(u32 pressed) {
             break;
         case 5: {
             u8 next = (game.audio_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
-            audio_restart_with_port(next);
-            save_write(&game);
+            audio_swap_request(next);
             break;
         }
         case 6:
@@ -1021,10 +1001,6 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
         g_aud_handle = -1;
     }
 
-    /* Give the kernel a moment to fully release the audio port before
-       we return to Lua.  Without this pause, the next payload launch
-       (which can happen within a couple of seconds) may still find the
-       port busy. */
     sleep_ms(400);
 
     if (fbs_mem) {
@@ -1063,6 +1039,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_out_fn      = 0;
     g_aud_mod         = 0;
     g_aud_actual_port = 2;
+    g_swap_active     = 0;
+    g_swap_target     = 2;
+    g_swap_old        = 2;
+    g_swap_reverting  = 0;
+    g_swap_phase      = 0;
+    g_swap_step_at    = 0;
+    g_swap_deadline   = 0;
     g_pad_mod         = -1;
     g_pad_fails       = 0;
     pad_prev          = 0;
@@ -1166,6 +1149,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         if (dt <= 0.0f) dt = 1.0f / 60.0f;
 
         haptic_tick();
+        audio_swap_tick();
 
         u32 raw = read_pad();
         if (raw != prev_raw_logged) {
