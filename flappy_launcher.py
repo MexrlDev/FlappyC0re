@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Flappy Bird PS5 launcher (mirrors the Doom-PS pattern)."""
-import argparse, datetime, os, platform, socket, sys, threading, time
+import argparse, datetime, os, platform, re, socket, sys, threading, time
 
 DEFAULT_PS5_IP    = ""                              # fill in
 DEFAULT_LAUNCHER  = "flappy.lua"
@@ -34,6 +34,11 @@ def get_local_ip():
     finally: s.close()
 
 
+def str_to_bool(v):
+    if isinstance(v, bool): return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
 class LogServer(threading.Thread):
     def __init__(self, port):
         super().__init__(daemon=True)
@@ -56,8 +61,9 @@ class LogServer(threading.Thread):
             except socket.timeout: continue
             except OSError: break
             ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"[{ts}] {addr[0]}  "
-                  f"{data.decode('utf-8','replace').rstrip()}", flush=True)
+            msg = data.decode("utf-8", "replace").rstrip()
+            msg = msg.encode("ascii", "replace").decode("ascii")
+            print(f"[{ts}] {addr[0]}  {msg}", flush=True)
         s.close()
     def stop(self):
         self._stop_event.set()
@@ -66,11 +72,32 @@ class LogServer(threading.Thread):
             except OSError: pass
 
 
-def send_lua(host, path, retries=5):
+def send_lua(host, path, pc_ip=None, retries=5):
     if not os.path.isfile(path):
         print(f"[!] missing {path}"); return False
-    with open(path, "rb") as f: data = f.read()
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        with open(path, "r") as f:
+            text = f.read()
+
+    replacement = pc_ip if pc_ip else ""
+    decl_pattern = 'local PC_IP        = "__PC_IP__"'
+    decl_new     = 'local PC_IP        = "' + replacement + '"'
+    if decl_pattern in text:
+        text = text.replace(decl_pattern, decl_new, 1)
+        print('[1]   Decl line replaced: PC_IP = "' + replacement + '"')
+    else:
+        pattern = r'(local\s+PC_IP\s*=\s*)"__PC_IP__"'
+        text, n = re.subn(pattern, r'\g<1>"' + replacement + '"', text, count=1)
+        if n == 0:
+            print("[!]   No PC_IP declaration found - file unchanged")
+
+    data = text.encode("utf-8")
     print(f"[1] Sending {os.path.basename(path)} ({len(data):,} B)")
+
     for i in range(1, retries + 1):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(10)
@@ -139,7 +166,9 @@ def main():
     ap.add_argument("host", nargs="?", default=DEFAULT_PS5_IP)
     ap.add_argument("--launcher",  "-l", default=DEFAULT_LAUNCHER)
     ap.add_argument("--shellcode", "-s", default=DEFAULT_SHELLCODE)
-    ap.add_argument("--no-log",    action="store_true")
+    ap.add_argument("--debug-logs", type=str_to_bool, default=True,
+                    metavar="true|false",
+                    help="capture UDP debug logs (default: true)")
     ap.add_argument("--local-ip",  default=None)
     ap.add_argument("--scport",    type=int, default=None)
     a = ap.parse_args()
@@ -151,6 +180,7 @@ def main():
     print("=" * 60)
     print(" Flappy Bird PS5 launcher")
     print(f" Host OS: {OS_NAME}")
+    print(f" Debug logs: {'ENABLED' if a.debug_logs else 'DISABLED'}")
     print("=" * 60)
 
     lua = find_file(a.launcher)
@@ -158,15 +188,23 @@ def main():
     if not lua: print(f"[!] {a.launcher} not found"); return 1
     if not sc:  print(f"[!] {a.shellcode} not found"); return 1
 
-    local_ip = a.local_ip or get_local_ip()
+    pc_ip = ""
+    if a.debug_logs:
+        pc_ip = a.local_ip or get_local_ip()
+        if pc_ip == "127.0.0.1":
+            print("[*] WARN: no LAN route detected - pass --local-ip")
+
     print(f"[*] console: {a.host}")
-    print(f"[*] PC IP:   {local_ip}  (edit flappy.lua PC_IP to match)")
+    if pc_ip:
+        print(f"[*] PC IP:   {pc_ip}")
+    else:
+        print(f"[*] PC IP:   (logs disabled - no UDP listener)")
 
     log = None
-    if not a.no_log:
+    if a.debug_logs and pc_ip:
         log = LogServer(LOG_PORT); log.start(); time.sleep(0.2)
 
-    if not send_lua(a.host, lua):
+    if not send_lua(a.host, lua, pc_ip=pc_ip):
         if log: log.stop()
         return 1
     time.sleep(1.0)
@@ -184,7 +222,10 @@ def main():
         return 1
 
     if log:
-        print("\n[*] logs — Ctrl-C to stop")
+        print()
+        print("[*] Watching logs. To stop:")
+        print("[*]   PC    -> press Ctrl+C")
+        print("[*]   Phone -> press the Stop button")
         try:
             while log.is_alive(): time.sleep(0.5)
         except KeyboardInterrupt: pass
