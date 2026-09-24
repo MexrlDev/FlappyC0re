@@ -11,16 +11,33 @@ static u32 checksum(const u32 *w, int n) {
     return x;
 }
 
+/* Try each path in order.  First one that opens read or write wins. */
+static const char *save_paths[] = {
+    "/savedata0/.savegame/flappy.sav",
+    "/av_contents/content_tmp/flappy.sav",
+    "/download0/flappy.sav",
+    NULL
+};
+
+static const char *active_path = NULL;
 static int ready;
 
 int save_init(void) {
+    /* Make sure the parent directories exist.  mkdir on an existing path
+       returns an error but that is harmless. */
     mkdir("/savedata0", 0777);
     mkdir("/savedata0/.savegame", 0777);
+    mkdir("/av_contents", 0777);
+    mkdir("/av_contents/content_tmp", 0777);
 
-    FILE *f = fopen(SAVE_PATH, "r");
-    if (f) { fclose(f); ready = 1; return 0; }
-    f = fopen(SAVE_PATH, "w");
-    if (f) { fclose(f); ready = 1; return 0; }
+    for (int i = 0; save_paths[i]; i++) {
+        FILE *f = fopen(save_paths[i], "r");
+        if (f) { fclose(f); active_path = save_paths[i]; ready = 1; return 0; }
+        f = fopen(save_paths[i], "w");
+        if (f) { fclose(f); active_path = save_paths[i]; ready = 1; return 0; }
+    }
+
+    active_path = NULL;
     ready = 0;
     return -1;
 }
@@ -28,15 +45,17 @@ int save_init(void) {
 int save_available(void) { return ready; }
 
 int save_load(struct game *g) {
-    if (!ready) return -1;
-    FILE *f = fopen(SAVE_PATH, "r");
+    if (!ready || !active_path) return -1;
+
+    FILE *f = fopen(active_path, "r");
     if (!f) return -1;
+
     struct save_blob b;
     size_t n = fread(&b, sizeof(b), 1, f);
     fclose(f);
+
     if (n != 1) return -1;
     if (b.magic != MAGIC) return -1;
-    /* checksum covers every u32 except the checksum itself */
     if (checksum(&b.magic, 8) != b.checksum) return -1;
 
     g->high_score     = (int)b.high_score;
@@ -45,7 +64,7 @@ int save_load(struct game *g) {
     if (b.diff < DIFF_COUNT) game_set_diff(g, (enum diff)b.diff);
     g->is_night = b.is_night ? 1 : 0;
 
-    /* v1 didn't have the field; default to on */
+    /* v1 saves did not have vibration_on; default to enabled */
     if (b.version >= 2)
         g->vibration_on = b.vibration_on ? 1 : 0;
     else
@@ -55,7 +74,8 @@ int save_load(struct game *g) {
 }
 
 int save_write(const struct game *g) {
-    if (!ready) return -1;
+    if (!ready || !active_path) return -1;
+
     struct save_blob b;
     b.magic          = MAGIC;
     b.version        = SAVE_VERSION;
@@ -67,7 +87,7 @@ int save_write(const struct game *g) {
     b.vibration_on   = g->vibration_on ? 1 : 0;
     b.checksum       = checksum(&b.magic, 8);
 
-    FILE *f = fopen(SAVE_PATH, "w");
+    FILE *f = fopen(active_path, "w");
     if (!f) return -1;
     size_t w = fwrite(&b, sizeof(b), 1, f);
     fclose(f);
