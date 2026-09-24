@@ -25,6 +25,7 @@ typedef __PTRDIFF_TYPE__ ptrdiff_t;
 #define HOST_GATE_OFF        0x31AA9u
 #define HOST_KERNEL_HANDLE   0x2001
 #define HOST_OFF_GS_THREAD   0x057F89B0u
+#define HOST_OFF_IOP_SPU2    0x05BF9738u
 #define HOST_OFF_VIDEO_OUT   0x02d695d0u
 #define HOST_OFF_SAVEDATA    0x003893F0u
 
@@ -81,6 +82,7 @@ static void *nc_sym_lookup(void *gate, void *dlsym,
 #define GADGET_OFFSET     HOST_GATE_OFF
 #define LIBKERNEL_HANDLE  HOST_KERNEL_HANDLE
 #define EBOOT_GS_THREAD   HOST_OFF_GS_THREAD
+#define EBOOT_IOP_SPU2    HOST_OFF_IOP_SPU2
 #define EBOOT_VIDOUT      HOST_OFF_VIDEO_OUT
 #define EBOOT_SAVEDATA_MOUNT_GOT  HOST_OFF_SAVEDATA
 
