@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 #ifndef CORE_H
 #define CORE_H
 
@@ -32,10 +33,6 @@ typedef s64 ptrdiff_t;
 #define SAMPLE_RATE     48000
 #define AUDIO_S16_STEREO 1
 
-/* Force GCC to emit RIP-relative LEA for function addresses */
-#define FORCE_FUNCPTR(func) ({ void *_a; \
-    __asm__("leaq " #func "(%%rip), %0" : "=r"(_a)); _a; })
-
 __attribute__((naked))
 static u64 native_call(void *gadget, void *fn,
                        u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6)
@@ -56,6 +53,7 @@ static u64 native_call(void *gadget, void *fn,
     );
 }
 
+__attribute__((unused))
 static void *resolve_sym(void *gadget, void *dlsym_fn, s32 handle,
                          const char *name)
 {
@@ -67,7 +65,6 @@ static void *resolve_sym(void *gadget, void *dlsym_fn, s32 handle,
 #define NC  native_call
 #define SYM resolve_sym
 
-/* Persist section: survives reset_game() BSS wipe */
 #define PERSIST __attribute__((section(".ps_persist")))
 
 #endif
