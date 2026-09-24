@@ -24,8 +24,6 @@ PERSIST static void *G, *D;
 
 /* ---------------- early diagnostic ---------------- */
 
-/* Sends a UDP datagram using only the stack and the dlsym pointer.
-   Does NOT touch any global.  Safe to call before relocations run. */
 static void early_send(u64 eboot, void *dlsym, s32 log_fd,
                        const u8 *log_sa, const char *msg, int msg_len)
 {
