@@ -14,7 +14,7 @@
 ---
 ## Added Options
 SFX - to lower/higher volume 
-Audio Output - Tv/Headphones < headphones .. plug a headphone into your controller
+!! AUTO SWIPE AUDIO WHEN HEADPHONE PLUGGED !!
 
 ---
 ## Setup
