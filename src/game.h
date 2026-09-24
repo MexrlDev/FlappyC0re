@@ -35,7 +35,7 @@ struct game {
     float pipe_speed;
     float pipe_gap;
     float pipe_spawn_acc;
-    float pipe_step;       /* distance between pipes */
+    float pipe_step;
 
     /* scoring */
     int   score, last_score, high_score;
@@ -52,7 +52,10 @@ struct game {
 
     /* menu */
     int   menu_cursor;
-    u32   flash_until_ms;   /* white flash on hit */
+    u8    vibration_on;
+    u8    show_credits;
+
+    u32   flash_until_ms;
 };
 
 void   game_init(struct game *g);
