@@ -36,8 +36,15 @@ PERSIST static void *g_aud_mod      = 0;
 PERSIST static u32 g_audio_next_try = 0;
 PERSIST static u32 g_audio_last_log = 0;
 
-/* Read-only display of the current physical output (best-effort). */
-PERSIST static const char *g_audio_display_name = "TV";
+/* Output type: 0 = TV, 1 = HEADPHONE. */
+#define OUT_TV        0
+#define OUT_HEADPHONE 1
+PERSIST static u8 g_audio_out_id = OUT_TV;
+
+/* For change-detection in the probe log. */
+PERSIST static u8 g_probe_prev[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+
+PERSIST static u32 g_audio_probe_next = 0;
 
 PERSIST static s32 g_pad_mod = -1;
 PERSIST static u32 g_pad_fails = 0;
@@ -386,10 +393,7 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-/* VOICE (2) is the only port we use for playback.  It mixes into whatever
-   the OS currently routes to (TV over HDMI, or the plugged-in headset). */
-#define PORT_VOICE   2
-#define PORT_PERSONAL 3
+#define PORT_VOICE 2
 
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
@@ -417,21 +421,50 @@ static s32 audio_try_open_voice(void) {
     return h;
 }
 
-/* Best-effort: try to open PERSONAL (3).  If it opens, assume headset
-   is physically connected.  Close it right away so it doesn't clash
-   with our VOICE handle. */
+/* Read a fresh DualSense report and inspect bytes 53..56.  Byte 54 bit 1
+   is set when a 3.5mm headphone is plugged into the controller on most
+   firmware revisions.  If we can't read the pad we default to TV. */
 static void audio_probe_output(void) {
-    s32 h = -1;
-    if (g_user_id > 0) h = try_open_audio_port(g_user_id, PORT_PERSONAL);
-    if (h < 0) h = try_open_audio_port(0xFF, PORT_PERSONAL);
+    u8 new_id = OUT_TV;
 
-    if (h >= 0) {
-        NC(G, g_aud_close_fn, (u64)h, 0,0,0,0,0);
-        g_audio_display_name = "HEADPHONE";
-    } else {
-        g_audio_display_name = "TV";
+    if (pad_h >= 0 && pad_read_fn) {
+        u8 buf[128];
+        for (int i = 0; i < 128; i++) buf[i] = 0;
+        s32 r = (s32)NC(G, pad_read_fn, (u64)pad_h, (u64)buf, 1, 0, 0, 0);
+        if (r > 0) {
+            u8 b53 = buf[53];
+            u8 b54 = buf[54];
+            u8 b55 = buf[55];
+            u8 b56 = buf[56];
+
+            /* Log whenever any of these bytes change, so we can see
+               the actual headphone-detection bit for this firmware. */
+            if (b53 != g_probe_prev[0] || b54 != g_probe_prev[1] ||
+                b55 != g_probe_prev[2] || b56 != g_probe_prev[3]) {
+                g_probe_prev[0] = b53;
+                g_probe_prev[1] = b54;
+                g_probe_prev[2] = b55;
+                g_probe_prev[3] = b56;
+                printf("audio: pad[53..56] = %02x %02x %02x %02x\n",
+                       b53, b54, b55, b56);
+            }
+
+            if (b54 & 0x02) new_id = OUT_HEADPHONE;
+        }
     }
-    printf("audio: display = %s\n", g_audio_display_name);
+
+    if (new_id != g_audio_out_id) {
+        g_audio_out_id = new_id;
+        printf("audio: output = %s\n",
+               g_audio_out_id == OUT_HEADPHONE ? "HEADPHONE" : "TV");
+    }
+}
+
+static void audio_probe_tick(void) {
+    u32 now = now_ms();
+    if (now < g_audio_probe_next) return;
+    g_audio_probe_next = now + 2000;
+    audio_probe_output();
 }
 
 static void audio_init_from(void) {
@@ -457,7 +490,7 @@ static void audio_init_from(void) {
     printf("audio: released %d stale handles\n", released);
     if (released > 0) sleep_ms(800);
 
-    /* Probe output type BEFORE opening our playback handle. */
+    /* First probe: read the pad. */
     audio_probe_output();
 
     s32 h = -1;
@@ -546,7 +579,6 @@ static void pad_init_from(void) {
            pad_h, (void*)pad_lb_fn);
 }
 
-/* Reset SETTINGS only.  Score and lifetime are preserved. */
 static void reset_settings_to_default(void) {
     printf("reset: settings (score preserved)\n");
 
@@ -565,16 +597,16 @@ static void reset_settings_to_default(void) {
 }
 
 /* ---------------- menu layout ----------------
-   0 START GAME
-   1 DIFFICULTY
-   2 BACKGROUND
-   3 VIBRATION
-   4 SFX
-   5 AUDIO OUTPUT   <- read-only display, greyed, skipped
-   6 SCREEN
-   7 RESET SCORE
-   8 SAVE STATUS
-   9 RESET SETTINGS
+   0  START GAME
+   1  DIFFICULTY
+   2  BACKGROUND
+   3  VIBRATION
+   4  SFX
+   5  AUDIO OUTPUT     <- read-only display, greyed, skipped
+   6  SCREEN
+   7  RESET SCORE
+   8  SAVE STATUS
+   9  RESET SETTINGS
    10 CREDITS
    11 EXIT
 */
@@ -637,7 +669,6 @@ static void draw_menu(void) {
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
         const char *text = menu_items[i];
 
-        /* AUDIO OUTPUT is always greyed. */
         if (i == AUDIO_OUTPUT_IDX) col = 0xFF606060u;
 
         if (i == 1) {
@@ -657,7 +688,7 @@ static void draw_menu(void) {
             text = line;
         } else if (i == AUDIO_OUTPUT_IDX) {
             snprintf(line, sizeof(line), "AUDIO OUTPUT: %s",
-                     g_audio_display_name);
+                     g_audio_out_id == OUT_HEADPHONE ? "HEADPHONE" : "TV");
             text = line;
         } else if (i == 6) {
             snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
@@ -802,7 +833,6 @@ static void menu_update(u32 pressed) {
             save_write(&game);
             break;
         case AUDIO_OUTPUT_IDX:
-            /* Read-only — do nothing. */
             break;
         case 6:
             game.screen_mode = (enum screen_mode)
@@ -836,6 +866,12 @@ static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state != last_gstate) {
         printf("STATE %d -> %d (f=%u)\n",
                (int)last_gstate, (int)game.state, (unsigned)total_frames);
+
+        /* Re-probe on any transition back to the menu. */
+        if (game.state == GS_MENU) {
+            g_audio_probe_next = 0;
+        }
+
         if (game.state == GS_GAMEOVER) haptic_death();
         last_gstate = game.state;
     }
@@ -995,7 +1031,10 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_mod           = 0;
     g_audio_next_try    = 0;
     g_audio_last_log    = 0;
-    g_audio_display_name = "TV";
+    g_audio_out_id      = OUT_TV;
+    g_audio_probe_next  = 0;
+    g_probe_prev[0] = 0xFF; g_probe_prev[1] = 0xFF;
+    g_probe_prev[2] = 0xFF; g_probe_prev[3] = 0xFF;
     g_pad_mod           = -1;
     g_pad_fails         = 0;
     pad_prev            = 0;
@@ -1047,7 +1086,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game_init(&game);
     game.vibration_on = 1;
     game.sfx_volume   = 100;
-    game.audio_port   = 2;      /* VOICE.  Kept for save compat. */
+    game.audio_port   = 2;
     save_load(&game);
 
     audio_set_master(game.sfx_volume);
@@ -1066,7 +1105,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
            save_available(), (int)g_user_id,
            game_screen_name(game.screen_mode),
            (unsigned)game.sfx_volume,
-           g_audio_display_name);
+           g_audio_out_id == OUT_HEADPHONE ? "HEADPHONE" : "TV");
 
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
@@ -1098,6 +1137,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         haptic_tick();
         audio_tick();
+        audio_probe_tick();
 
         u32 raw = read_pad();
         if (raw != prev_raw_logged) {
