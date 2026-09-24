@@ -33,17 +33,11 @@ PERSIST static void *g_aud_open_fn  = 0;
 PERSIST static void *g_aud_out_fn   = 0;
 PERSIST static void *g_aud_mod      = 0;
 
-/* Audio state */
-PERSIST static u8  g_audio_want   = 2;      /* user-requested port */
-PERSIST static u8  g_audio_actual = 2;      /* actual open port   */
-
-PERSIST static int g_audio_busy = 0;
-PERSIST static u8  g_audio_busy_target = 0;
-PERSIST static u32 g_audio_busy_until = 0;
 PERSIST static u32 g_audio_next_try = 0;
-PERSIST static u32 g_audio_cooldown_until = 0;
-PERSIST static u32 g_audio_closed_at = 0;
 PERSIST static u32 g_audio_last_log = 0;
+
+/* Read-only display of the current physical output (best-effort). */
+PERSIST static const char *g_audio_display_name = "TV";
 
 PERSIST static s32 g_pad_mod = -1;
 PERSIST static u32 g_pad_fails = 0;
@@ -392,13 +386,10 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-#define PORT_TV       2
-#define PORT_HEADSET  3
-
-static u8 port_normalize(u8 p) {
-    if (p == PORT_HEADSET) return PORT_HEADSET;
-    return PORT_TV;
-}
+/* VOICE (2) is the only port we use for playback.  It mixes into whatever
+   the OS currently routes to (TV over HDMI, or the plugged-in headset). */
+#define PORT_VOICE   2
+#define PORT_PERSONAL 3
 
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
@@ -419,22 +410,28 @@ static int audio_sweep_stale_handles(void) {
     return released;
 }
 
-/* Fast try to open `port`.  Returns handle or -1. */
-static s32 audio_try_open_once(u8 port) {
+static s32 audio_try_open_voice(void) {
     s32 h = -1;
-    if (g_user_id > 0) h = try_open_audio_port(g_user_id, (s32)port);
-    if (h < 0) h = try_open_audio_port(0xFF, (s32)port);
+    if (g_user_id > 0) h = try_open_audio_port(g_user_id, PORT_VOICE);
+    if (h < 0) h = try_open_audio_port(0xFF, PORT_VOICE);
     return h;
 }
 
-/* Attach an opened handle and mark audio as running. */
-static void audio_attach(s32 h, u8 port) {
-    g_aud_handle   = h;
-    g_audio_actual = port;
-    g_audio_want   = port;
-    game.audio_port = port;
-    audio_init(h, g_aud_out_fn, G);
-    save_write(&game);
+/* Best-effort: try to open PERSONAL (3).  If it opens, assume headset
+   is physically connected.  Close it right away so it doesn't clash
+   with our VOICE handle. */
+static void audio_probe_output(void) {
+    s32 h = -1;
+    if (g_user_id > 0) h = try_open_audio_port(g_user_id, PORT_PERSONAL);
+    if (h < 0) h = try_open_audio_port(0xFF, PORT_PERSONAL);
+
+    if (h >= 0) {
+        NC(G, g_aud_close_fn, (u64)h, 0,0,0,0,0);
+        g_audio_display_name = "HEADPHONE";
+    } else {
+        g_audio_display_name = "TV";
+    }
+    printf("audio: display = %s\n", g_audio_display_name);
 }
 
 static void audio_init_from(void) {
@@ -460,178 +457,43 @@ static void audio_init_from(void) {
     printf("audio: released %d stale handles\n", released);
     if (released > 0) sleep_ms(800);
 
-    u8 preferred = port_normalize(game.audio_port);
-    u8 other     = (preferred == PORT_TV) ? PORT_HEADSET : PORT_TV;
-    g_audio_want   = preferred;
-    g_audio_actual = preferred;
+    /* Probe output type BEFORE opening our playback handle. */
+    audio_probe_output();
 
-    /* Quick startup attempt: 3 tries per port, 250 ms apart (max 1.5s). */
     s32 h = -1;
-    for (int i = 0; i < 3 && h < 0; i++) {
-        h = audio_try_open_once(preferred);
-        if (h < 0 && i < 2) sleep_ms(250);
+    for (int i = 0; i < 6 && h < 0; i++) {
+        h = audio_try_open_voice();
+        if (h < 0 && i < 5) sleep_ms(300);
     }
-    printf("audio: try %s -> %d (0x%08x)\n",
-           game_audio_port_name(preferred), h, (unsigned)h);
+    printf("audio: try VOICE -> %d (0x%08x)\n", h, (unsigned)h);
 
     if (h < 0) {
-        for (int i = 0; i < 3 && h < 0; i++) {
-            h = audio_try_open_once(other);
-            if (h < 0 && i < 2) sleep_ms(250);
-        }
-        printf("audio: try %s -> %d (0x%08x)\n",
-               game_audio_port_name(other), h, (unsigned)h);
-        if (h >= 0) {
-            audio_attach(h, other);
-            return;
-        }
-    } else {
-        audio_attach(h, preferred);
+        printf("audio: no port yet, will retry in background\n");
+        g_audio_next_try = now_ms() + 1000;
         return;
     }
 
-    /* Both failed at startup.  Keep the wanted port; the main loop's
-       background recovery will keep trying every second until a port
-       opens.  This is what fixes the "no audio, grey forever" bug: we
-       never give up, and we never block the menu. */
-    printf("audio: no port yet, will retry in background\n");
-    g_audio_next_try = now_ms() + 1000;
+    printf("audio: handle=%d\n", h);
+    g_aud_handle = h;
+    audio_init(h, g_aud_out_fn, G);
 }
 
-/* Menu item is grey when a swap is running or during the 1.5s cooldown
-   right after a successful swap.  Never greys "forever" because swaps
-   have a hard 5-second watchdog. */
-static int audio_is_busy(void) {
-    if (g_audio_busy) return 1;
-    if (now_ms() < g_audio_cooldown_until) return 1;
-    return 0;
-}
-
-/* User-facing port change request.  Non-blocking. */
-static void audio_request(u8 target) {
-    target = port_normalize(target);
-
-    if (g_audio_busy) {
-        printf("audio: busy, ignoring request\n");
-        return;
-    }
-
-    /* Already on this port with a valid handle? Nothing to do. */
-    if (g_aud_handle >= 0 && g_audio_actual == target) {
-        g_audio_want    = target;
-        game.audio_port = target;
-        save_write(&game);
-        printf("audio: already on %s\n", game_audio_port_name(target));
-        return;
-    }
-
-    /* No handle open yet (startup failed).  Just change our wish and
-       let background recovery pick it up.  Do NOT enter swap mode. */
-    if (g_aud_handle < 0) {
-        g_audio_want    = target;
-        g_audio_actual  = target;
-        game.audio_port = target;
-        save_write(&game);
-        g_audio_next_try = now_ms();
-        printf("audio: want %s (recovery will open)\n",
-               game_audio_port_name(target));
-        return;
-    }
-
-    /* We have a handle on a different port.  Do a real swap. */
-    printf("audio: swap -> %s\n", game_audio_port_name(target));
-    g_audio_busy        = 1;
-    g_audio_busy_target = target;
-    g_audio_busy_until  = now_ms() + 5000;    /* hard watchdog */
-    g_audio_want        = target;
-    g_audio_next_try    = now_ms();
-    g_audio_closed_at   = 0;
-    g_audio_last_log    = 0;
-    g_audio_pause       = 1;
-    game.audio_port     = target;
-    save_write(&game);
-}
-
-/* Runs every frame.  Handles the swap state machine AND background
-   recovery when no handle is open.  Never blocks. */
+/* Background recovery: if no handle open, keep trying every second. */
 static void audio_tick(void) {
+    if (g_aud_handle >= 0) return;
+
     u32 now = now_ms();
+    if (now < g_audio_next_try) return;
+    g_audio_next_try = now + 1000;
 
-    /* ---------- Active swap ---------- */
-    if (g_audio_busy) {
-        /* Close current handle once. */
-        if (g_aud_handle >= 0) {
-            audio_shutdown();
-            s32 r = (s32)NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
-            printf("audio: closed %d (%d)\n", g_aud_handle, r);
-            g_aud_handle = -1;
-            g_audio_closed_at = now + 300;   /* kernel cooldown */
-            g_audio_next_try  = g_audio_closed_at;
-            return;
-        }
-
-        if (now < g_audio_closed_at) return;
-        if (now < g_audio_next_try)  return;
-        g_audio_next_try = now + 100;
-
-        /* Try target first, then old port as fallback. */
-        u8 order[2];
-        order[0] = g_audio_busy_target;
-        order[1] = g_audio_actual;
-
-        for (int i = 0; i < 2; i++) {
-            if (order[i] == order[0] && i > 0) continue;  /* skip dup */
-            s32 h = audio_try_open_once(order[i]);
-            if (h >= 0) {
-                audio_attach(h, order[i]);
-                printf("audio: now on %s (handle %d)\n",
-                       game_audio_port_name(order[i]), h);
-                g_audio_busy          = 0;
-                g_audio_pause         = 0;
-                g_audio_cooldown_until = now + 1500;
-                return;
-            }
-        }
-
-        /* Log every 2s so we can see it's still working. */
-        if (now - g_audio_last_log > 2000) {
-            g_audio_last_log = now;
-            printf("audio: still trying %s / %s\n",
-                   game_audio_port_name(g_audio_busy_target),
-                   game_audio_port_name(g_audio_actual));
-        }
-
-        /* Watchdog: hard stop after 5 seconds.  Menu re-enables. */
-        if (now >= g_audio_busy_until) {
-            printf("audio: swap watchdog fired, releasing\n");
-            g_audio_busy           = 0;
-            g_audio_pause          = 0;
-            g_audio_cooldown_until = now + 1500;
-            g_audio_next_try       = now + 1500;
-            /* No handle, but keep recovery going. */
-        }
-        return;
-    }
-
-    /* ---------- Background recovery (no handle) ---------- */
-    if (g_aud_handle < 0) {
-        if (now < g_audio_cooldown_until) return;
-        if (now < g_audio_next_try) return;
-        g_audio_next_try = now + 1000;
-
-        u8 order[2];
-        order[0] = g_audio_want;
-        order[1] = (g_audio_want == PORT_TV) ? PORT_HEADSET : PORT_TV;
-
-        for (int i = 0; i < 2; i++) {
-            s32 h = audio_try_open_once(order[i]);
-            if (h >= 0) {
-                audio_attach(h, order[i]);
-                printf("audio: recovered on %s (handle %d)\n",
-                       game_audio_port_name(order[i]), h);
-                return;
-            }
-        }
+    s32 h = audio_try_open_voice();
+    if (h >= 0) {
+        printf("audio: recovered (handle %d)\n", h);
+        g_aud_handle = h;
+        audio_init(h, g_aud_out_fn, G);
+    } else if (now - g_audio_last_log > 5000) {
+        g_audio_last_log = now;
+        printf("audio: still no port (0x%08x)\n", (unsigned)h);
     }
 }
 
@@ -697,17 +559,27 @@ static void reset_settings_to_default(void) {
     audio_set_master(game.sfx_volume);
     haptic_apply_toggle();
 
-    if (g_audio_actual != PORT_TV || g_aud_handle < 0) {
-        audio_request(PORT_TV);
-    } else {
-        game.audio_port = PORT_TV;
-    }
-
     save_write(&game);
 
-    printf("reset: done, port=%s high=%d\n",
-           game_audio_port_name(game.audio_port), game.high_score);
+    printf("reset: done high=%d\n", game.high_score);
 }
+
+/* ---------------- menu layout ----------------
+   0 START GAME
+   1 DIFFICULTY
+   2 BACKGROUND
+   3 VIBRATION
+   4 SFX
+   5 AUDIO OUTPUT   <- read-only display, greyed, skipped
+   6 SCREEN
+   7 RESET SCORE
+   8 SAVE STATUS
+   9 RESET SETTINGS
+   10 CREDITS
+   11 EXIT
+*/
+#define AUDIO_OUTPUT_IDX 5
+#define MENU_COUNT 12
 
 static const char *menu_items[] = {
     "START GAME",
@@ -723,7 +595,12 @@ static const char *menu_items[] = {
     "CREDITS",
     "EXIT",
 };
-#define MENU_COUNT 12
+
+static void cursor_step(int dir) {
+    do {
+        game.menu_cursor = (game.menu_cursor + MENU_COUNT + dir) % MENU_COUNT;
+    } while (game.menu_cursor == AUDIO_OUTPUT_IDX);
+}
 
 static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
@@ -760,9 +637,8 @@ static void draw_menu(void) {
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
         const char *text = menu_items[i];
 
-        if (i == 5 && audio_is_busy()) {
-            col = 0xFF606060u;
-        }
+        /* AUDIO OUTPUT is always greyed. */
+        if (i == AUDIO_OUTPUT_IDX) col = 0xFF606060u;
 
         if (i == 1) {
             snprintf(line, sizeof(line), "DIFFICULTY: %s", game_diff_name(game.diff));
@@ -779,9 +655,9 @@ static void draw_menu(void) {
             else                              snprintf(line, sizeof(line), "SFX: %u%%",
                                                          (unsigned)game.sfx_volume);
             text = line;
-        } else if (i == 5) {
+        } else if (i == AUDIO_OUTPUT_IDX) {
             snprintf(line, sizeof(line), "AUDIO OUTPUT: %s",
-                     game_audio_port_name(game.audio_port));
+                     g_audio_display_name);
             text = line;
         } else if (i == 6) {
             snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
@@ -874,10 +750,8 @@ static void menu_update(u32 pressed) {
         return;
     }
 
-    if (pressed & DS_UP)
-        game.menu_cursor = (game.menu_cursor + MENU_COUNT - 1) % MENU_COUNT;
-    if (pressed & DS_DOWN)
-        game.menu_cursor = (game.menu_cursor + 1) % MENU_COUNT;
+    if (pressed & DS_UP)   cursor_step(-1);
+    if (pressed & DS_DOWN) cursor_step(+1);
 
     if (pressed & (DS_LEFT | DS_RIGHT)) {
         int dir = (pressed & DS_RIGHT) ? 1 : -1;
@@ -899,11 +773,6 @@ static void menu_update(u32 pressed) {
             game.sfx_volume = (u8)v;
             audio_set_master(game.sfx_volume);
             save_write(&game);
-        } else if (game.menu_cursor == 5) {
-            if (!audio_is_busy()) {
-                u8 next = (game.audio_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
-                audio_request(next);
-            }
         } else if (game.menu_cursor == 6) {
             int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
             game.screen_mode = (enum screen_mode)m;
@@ -932,13 +801,9 @@ static void menu_update(u32 pressed) {
             audio_set_master(game.sfx_volume);
             save_write(&game);
             break;
-        case 5: {
-            if (!audio_is_busy()) {
-                u8 next = (game.audio_port == PORT_TV) ? PORT_HEADSET : PORT_TV;
-                audio_request(next);
-            }
+        case AUDIO_OUTPUT_IDX:
+            /* Read-only — do nothing. */
             break;
-        }
         case 6:
             game.screen_mode = (enum screen_mode)
                 ((game.screen_mode + 1) % SCREEN_MODE_COUNT);
@@ -1128,15 +993,9 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_open_fn       = 0;
     g_aud_out_fn        = 0;
     g_aud_mod           = 0;
-    g_audio_want        = 2;
-    g_audio_actual      = 2;
-    g_audio_busy        = 0;
-    g_audio_busy_target = 0;
-    g_audio_busy_until  = 0;
     g_audio_next_try    = 0;
-    g_audio_cooldown_until = 0;
-    g_audio_closed_at   = 0;
     g_audio_last_log    = 0;
+    g_audio_display_name = "TV";
     g_pad_mod           = -1;
     g_pad_fails         = 0;
     pad_prev            = 0;
@@ -1188,10 +1047,8 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game_init(&game);
     game.vibration_on = 1;
     game.sfx_volume   = 100;
-    game.audio_port   = PORT_TV;
+    game.audio_port   = 2;      /* VOICE.  Kept for save compat. */
     save_load(&game);
-
-    game.audio_port = port_normalize(game.audio_port);
 
     audio_set_master(game.sfx_volume);
 
@@ -1203,13 +1060,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
-    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u port=%s\n",
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u out=%s\n",
            nreloc, video_h, pad_h,
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), (int)g_user_id,
            game_screen_name(game.screen_mode),
            (unsigned)game.sfx_volume,
-           game_audio_port_name(game.audio_port));
+           g_audio_display_name);
 
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
