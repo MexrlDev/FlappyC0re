@@ -20,28 +20,40 @@ TARGET_ELF := flappy.elf
 TARGET_BIN := flappy.bin
 TARGET_HEX := flappy.hex
 
-# All files the bake script produces
 ASSET_OUTPUTS := src/assets.h src/assets.bin src/assets.S
+ASSET_SCRIPT  := tools/bake_assets.py
 
-.PHONY: all clean hex
+.PHONY: all clean hex assets
 
 all: $(TARGET_BIN) $(TARGET_ELF) $(TARGET_HEX)
 
-# Grouped target: one recipe run produces all three files.
-# Requires GNU make >= 4.3 (Ubuntu 24.04 ships 4.3).
-$(ASSET_OUTPUTS) &: tools/bake_assets.py $(wildcard assets/*.png assets/*.wav)
+# Fail with a clear message if the bake script is missing from the tree.
+ifeq ($(wildcard $(ASSET_SCRIPT)),)
+$(error $(ASSET_SCRIPT) not found.  Did you commit it?  \
+        Check with: git ls-files tools/)
+endif
+
+# Stamp-file approach: the bake script runs once, produces all three
+# generated files, and we touch a stamp so make knows it's up to date.
+# Portable to make < 4.3 (grouped targets `&:` need 4.3+).
+src/.assets.stamp: $(ASSET_SCRIPT) \
+                   $(wildcard assets/*.png) $(wildcard assets/*.wav)
 	@mkdir -p src
-	$(PY) tools/bake_assets.py
+	$(PY) $(ASSET_SCRIPT)
+	@touch $@
+
+$(ASSET_OUTPUTS): src/.assets.stamp
+	@test -f $@ || { rm -f src/.assets.stamp; $(MAKE) src/.assets.stamp; }
+
+assets: $(ASSET_OUTPUTS)
 
 build:
 	@mkdir -p build
 
-# Pattern rule for C sources.  assets.h is a generated prerequisite.
-build/%.o: src/%.c src/assets.h | build
+build/%.o: src/%.c $(ASSET_OUTPUTS) | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Assembly blob that .incbin's src/assets.bin
-build/assets.o: src/assets.S src/assets.bin | build
+build/assets.o: src/assets.S $(ASSET_OUTPUTS) | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET_ELF): $(OBJ) $(ASM_OBJ) linker.ld
@@ -59,4 +71,4 @@ hex: $(TARGET_BIN)
 clean:
 	rm -rf build
 	rm -f $(TARGET_ELF) $(TARGET_BIN) $(TARGET_HEX)
-	rm -f $(ASSET_OUTPUTS)
+	rm -f $(ASSET_OUTPUTS) src/.assets.stamp
