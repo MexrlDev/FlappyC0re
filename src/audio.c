@@ -100,25 +100,16 @@ void audio_play(enum asset_id id, float vol) {
     voices[slot].kill_countdown = 0;
 }
 
-static inline int soft_clip(int x) {
-    const int KNEE = 22000;
-    const int MAX  = 32760;
-    const int ROOM = MAX - KNEE;
-    if (x > KNEE) {
-        int over = x - KNEE;
-        return KNEE + (int)(((s64)ROOM * over) / (over + ROOM));
-    }
-    if (x < -KNEE) {
-        int over = -x - KNEE;
-        return -(KNEE + (int)(((s64)ROOM * over) / (over + ROOM)));
-    }
-    return x;
-}
-
 void audio_mix_tick(void) {
     if (audio_handle < 0 || !audio_out_fn) return;
 
-    int master = audio_master;
+    int n_active = 0;
+    for (int v = 0; v < NUM_VOICES; v++) {
+        if (voices[v].active) n_active++;
+    }
+    if (n_active < 1) n_active = 1;
+
+    int vol_scale_q8 = (audio_master * 256) / (100 * n_active);
 
     for (int i = 0; i < GRAIN; i++) {
         int acc = 0;
@@ -157,8 +148,10 @@ void audio_mix_tick(void) {
             acc += (int)(sample * gain);
         }
 
-        acc = (acc * master) / 100;
-        acc = soft_clip(acc);
+        acc = (acc * vol_scale_q8) >> 8;
+
+        if (acc >  32760) acc =  32760;
+        if (acc < -32760) acc = -32760;
 
         mix_buf[i*2]   = (s16)acc;
         mix_buf[i*2+1] = (s16)acc;
