@@ -12,6 +12,11 @@
 | Options button | Pause/Resume (In Game) |
 
 ---
+## Added Options
+SFX - to lower/higher volume 
+Audio Output - Tv/Headphones < headphones .. plug a headphone into your controller
+
+---
 ## Setup
 1. Get the release zip, or copy the lua/py from the source code from this repo
 2. In Pythonica/PyCode for mobile go to SetUp for mobile
