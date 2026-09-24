@@ -1,5 +1,24 @@
 # FlappyC0re
 * [The Big One!](https://youtu.be/VHOCPpjUtD8?si=mlzagng2nm-eBmUX)
+---
+## Screenshots
+
+<img src="https://raw.githubusercontent.com/MexrlDev/FlappyC0re/refs/heads/main/.Images/IMG_0564.jpeg?token=GHSAT0AAAAAAD6SGBT2DFX6M46ZNZC5V2A42VVFDJA" width="600">
+
+<details>
+<summary>More Screenshots</summary>
+
+<img src="https://github.com/MexrlDev/FlappyC0re/raw/refs/heads/main/.Images/IMG_0567.jpeg" width="600">
+
+---
+
+<img src="https://github.com/MexrlDev/FlappyC0re/raw/refs/heads/main/.Images/IMG_0565.jpeg" width="600">
+
+---
+
+<img src="https://github.com/MexrlDev/FlappyC0re/raw/refs/heads/main/.Images/IMG_0566.jpeg" width="600">
+
+</details>
 
 ---
 ## Readme
