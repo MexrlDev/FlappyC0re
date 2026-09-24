@@ -36,16 +36,6 @@ PERSIST static void *g_aud_mod      = 0;
 PERSIST static u32 g_audio_next_try = 0;
 PERSIST static u32 g_audio_last_log = 0;
 
-/* Output type: 0 = TV, 1 = HEADPHONE. */
-#define OUT_TV        0
-#define OUT_HEADPHONE 1
-PERSIST static u8 g_audio_out_id = OUT_TV;
-
-/* For change-detection in the probe log. */
-PERSIST static u8 g_probe_prev[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-
-PERSIST static u32 g_audio_probe_next = 0;
-
 PERSIST static s32 g_pad_mod = -1;
 PERSIST static u32 g_pad_fails = 0;
 
@@ -393,7 +383,11 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-#define PORT_VOICE 2
+/* Port types tried in order.  VOICE and PERSONAL are the two the OS
+   routes userland audio into; MAIN and BGM sometimes open if the system
+   daemon has released them; PADSPK is a last resort. */
+static const s32 kPortOrder[] = { 2, 3, 0, 1, 4 };
+#define N_PORTS ((int)(sizeof(kPortOrder) / sizeof(kPortOrder[0])))
 
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
@@ -414,57 +408,19 @@ static int audio_sweep_stale_handles(void) {
     return released;
 }
 
-static s32 audio_try_open_voice(void) {
-    s32 h = -1;
-    if (g_user_id > 0) h = try_open_audio_port(g_user_id, PORT_VOICE);
-    if (h < 0) h = try_open_audio_port(0xFF, PORT_VOICE);
-    return h;
-}
-
-/* Read a fresh DualSense report and inspect bytes 53..56.  Byte 54 bit 1
-   is set when a 3.5mm headphone is plugged into the controller on most
-   firmware revisions.  If we can't read the pad we default to TV. */
-static void audio_probe_output(void) {
-    u8 new_id = OUT_TV;
-
-    if (pad_h >= 0 && pad_read_fn) {
-        u8 buf[128];
-        for (int i = 0; i < 128; i++) buf[i] = 0;
-        s32 r = (s32)NC(G, pad_read_fn, (u64)pad_h, (u64)buf, 1, 0, 0, 0);
-        if (r > 0) {
-            u8 b53 = buf[53];
-            u8 b54 = buf[54];
-            u8 b55 = buf[55];
-            u8 b56 = buf[56];
-
-            /* Log whenever any of these bytes change, so we can see
-               the actual headphone-detection bit for this firmware. */
-            if (b53 != g_probe_prev[0] || b54 != g_probe_prev[1] ||
-                b55 != g_probe_prev[2] || b56 != g_probe_prev[3]) {
-                g_probe_prev[0] = b53;
-                g_probe_prev[1] = b54;
-                g_probe_prev[2] = b55;
-                g_probe_prev[3] = b56;
-                printf("audio: pad[53..56] = %02x %02x %02x %02x\n",
-                       b53, b54, b55, b56);
-            }
-
-            if (b54 & 0x02) new_id = OUT_HEADPHONE;
+/* Try each port in order.  Returns handle or -1. */
+static s32 audio_try_all_ports(int *opened_type) {
+    for (int i = 0; i < N_PORTS; i++) {
+        s32 p = kPortOrder[i];
+        s32 h = -1;
+        if (g_user_id > 0) h = try_open_audio_port(g_user_id, p);
+        if (h < 0) h = try_open_audio_port(0xFF, p);
+        if (h >= 0) {
+            if (opened_type) *opened_type = p;
+            return h;
         }
     }
-
-    if (new_id != g_audio_out_id) {
-        g_audio_out_id = new_id;
-        printf("audio: output = %s\n",
-               g_audio_out_id == OUT_HEADPHONE ? "HEADPHONE" : "TV");
-    }
-}
-
-static void audio_probe_tick(void) {
-    u32 now = now_ms();
-    if (now < g_audio_probe_next) return;
-    g_audio_probe_next = now + 2000;
-    audio_probe_output();
+    return -1;
 }
 
 static void audio_init_from(void) {
@@ -490,15 +446,14 @@ static void audio_init_from(void) {
     printf("audio: released %d stale handles\n", released);
     if (released > 0) sleep_ms(800);
 
-    /* First probe: read the pad. */
-    audio_probe_output();
-
+    /* Try every port.  Retry the full cycle a couple of times in case
+       the kernel is still releasing from a previous session. */
+    int opened_type = -1;
     s32 h = -1;
-    for (int i = 0; i < 6 && h < 0; i++) {
-        h = audio_try_open_voice();
-        if (h < 0 && i < 5) sleep_ms(300);
+    for (int attempt = 0; attempt < 3 && h < 0; attempt++) {
+        h = audio_try_all_ports(&opened_type);
+        if (h < 0 && attempt < 2) sleep_ms(400);
     }
-    printf("audio: try VOICE -> %d (0x%08x)\n", h, (unsigned)h);
 
     if (h < 0) {
         printf("audio: no port yet, will retry in background\n");
@@ -506,27 +461,29 @@ static void audio_init_from(void) {
         return;
     }
 
-    printf("audio: handle=%d\n", h);
+    printf("audio: handle=%d (port %d)\n", h, opened_type);
     g_aud_handle = h;
     audio_init(h, g_aud_out_fn, G);
 }
 
-/* Background recovery: if no handle open, keep trying every second. */
+/* Background recovery: if no handle, cycle through all ports every
+   second until one opens.  Never stops trying. */
 static void audio_tick(void) {
     if (g_aud_handle >= 0) return;
 
     u32 now = now_ms();
     if (now < g_audio_next_try) return;
-    g_audio_next_try = now + 1000;
+    g_audio_next_try = now + 1500;
 
-    s32 h = audio_try_open_voice();
+    int opened_type = -1;
+    s32 h = audio_try_all_ports(&opened_type);
     if (h >= 0) {
-        printf("audio: recovered (handle %d)\n", h);
+        printf("audio: recovered (handle %d, port %d)\n", h, opened_type);
         g_aud_handle = h;
         audio_init(h, g_aud_out_fn, G);
     } else if (now - g_audio_last_log > 5000) {
         g_audio_last_log = now;
-        printf("audio: still no port (0x%08x)\n", (unsigned)h);
+        printf("audio: still no port\n");
     }
 }
 
@@ -579,6 +536,7 @@ static void pad_init_from(void) {
            pad_h, (void*)pad_lb_fn);
 }
 
+/* Reset SETTINGS only.  Score and lifetime are preserved. */
 static void reset_settings_to_default(void) {
     printf("reset: settings (score preserved)\n");
 
@@ -602,16 +560,14 @@ static void reset_settings_to_default(void) {
    2  BACKGROUND
    3  VIBRATION
    4  SFX
-   5  AUDIO OUTPUT     <- read-only display, greyed, skipped
-   6  SCREEN
-   7  RESET SCORE
-   8  SAVE STATUS
-   9  RESET SETTINGS
-   10 CREDITS
-   11 EXIT
+   5  SCREEN
+   6  RESET SCORE
+   7  SAVE STATUS
+   8  RESET SETTINGS
+   9  CREDITS
+   10 EXIT
 */
-#define AUDIO_OUTPUT_IDX 5
-#define MENU_COUNT 12
+#define MENU_COUNT 11
 
 static const char *menu_items[] = {
     "START GAME",
@@ -619,7 +575,6 @@ static const char *menu_items[] = {
     "BACKGROUND",
     "VIBRATION",
     "SFX",
-    "AUDIO OUTPUT",
     "SCREEN",
     "RESET SCORE",
     "SAVE STATUS",
@@ -627,12 +582,6 @@ static const char *menu_items[] = {
     "CREDITS",
     "EXIT",
 };
-
-static void cursor_step(int dir) {
-    do {
-        game.menu_cursor = (game.menu_cursor + MENU_COUNT + dir) % MENU_COUNT;
-    } while (game.menu_cursor == AUDIO_OUTPUT_IDX);
-}
 
 static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
@@ -663,14 +612,11 @@ static void draw_menu(void) {
     render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
 
     int base_y = 300;
-    int step   = 48;
+    int step   = 52;
     for (int i = 0; i < MENU_COUNT; i++) {
         char line[64];
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
         const char *text = menu_items[i];
-
-        if (i == AUDIO_OUTPUT_IDX) col = 0xFF606060u;
-
         if (i == 1) {
             snprintf(line, sizeof(line), "DIFFICULTY: %s", game_diff_name(game.diff));
             text = line;
@@ -686,17 +632,13 @@ static void draw_menu(void) {
             else                              snprintf(line, sizeof(line), "SFX: %u%%",
                                                          (unsigned)game.sfx_volume);
             text = line;
-        } else if (i == AUDIO_OUTPUT_IDX) {
-            snprintf(line, sizeof(line), "AUDIO OUTPUT: %s",
-                     g_audio_out_id == OUT_HEADPHONE ? "HEADPHONE" : "TV");
-            text = line;
-        } else if (i == 6) {
+        } else if (i == 5) {
             snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
             text = line;
-        } else if (i == 7) {
+        } else if (i == 6) {
             snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
             text = line;
-        } else if (i == 8) {
+        } else if (i == 7) {
             snprintf(line, sizeof(line), "SAVE: %s",
                      save_available() ? "OK" : "NO SAVEDATA");
             text = line;
@@ -781,8 +723,10 @@ static void menu_update(u32 pressed) {
         return;
     }
 
-    if (pressed & DS_UP)   cursor_step(-1);
-    if (pressed & DS_DOWN) cursor_step(+1);
+    if (pressed & DS_UP)
+        game.menu_cursor = (game.menu_cursor + MENU_COUNT - 1) % MENU_COUNT;
+    if (pressed & DS_DOWN)
+        game.menu_cursor = (game.menu_cursor + 1) % MENU_COUNT;
 
     if (pressed & (DS_LEFT | DS_RIGHT)) {
         int dir = (pressed & DS_RIGHT) ? 1 : -1;
@@ -804,7 +748,7 @@ static void menu_update(u32 pressed) {
             game.sfx_volume = (u8)v;
             audio_set_master(game.sfx_volume);
             save_write(&game);
-        } else if (game.menu_cursor == 6) {
+        } else if (game.menu_cursor == 5) {
             int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
             game.screen_mode = (enum screen_mode)m;
             save_write(&game);
@@ -832,27 +776,25 @@ static void menu_update(u32 pressed) {
             audio_set_master(game.sfx_volume);
             save_write(&game);
             break;
-        case AUDIO_OUTPUT_IDX:
-            break;
-        case 6:
+        case 5:
             game.screen_mode = (enum screen_mode)
                 ((game.screen_mode + 1) % SCREEN_MODE_COUNT);
             save_write(&game);
             break;
-        case 7:
+        case 6:
             game.high_score = 0;
             game.last_score = 0;
             save_write(&game);
             break;
-        case 8:
+        case 7:
             break;
-        case 9:
+        case 8:
             reset_settings_to_default();
             break;
-        case 10:
+        case 9:
             game.show_credits = 1;
             break;
-        case 11:
+        case 10:
             save_write(&game);
             g_exit_now = 1;
             break;
@@ -866,12 +808,6 @@ static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state != last_gstate) {
         printf("STATE %d -> %d (f=%u)\n",
                (int)last_gstate, (int)game.state, (unsigned)total_frames);
-
-        /* Re-probe on any transition back to the menu. */
-        if (game.state == GS_MENU) {
-            g_audio_probe_next = 0;
-        }
-
         if (game.state == GS_GAMEOVER) haptic_death();
         last_gstate = game.state;
     }
@@ -1031,10 +967,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_mod           = 0;
     g_audio_next_try    = 0;
     g_audio_last_log    = 0;
-    g_audio_out_id      = OUT_TV;
-    g_audio_probe_next  = 0;
-    g_probe_prev[0] = 0xFF; g_probe_prev[1] = 0xFF;
-    g_probe_prev[2] = 0xFF; g_probe_prev[3] = 0xFF;
     g_pad_mod           = -1;
     g_pad_fails         = 0;
     pad_prev            = 0;
@@ -1099,13 +1031,12 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
-    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u out=%s\n",
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u\n",
            nreloc, video_h, pad_h,
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), (int)g_user_id,
            game_screen_name(game.screen_mode),
-           (unsigned)game.sfx_volume,
-           g_audio_out_id == OUT_HEADPHONE ? "HEADPHONE" : "TV");
+           (unsigned)game.sfx_volume);
 
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
@@ -1137,7 +1068,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         haptic_tick();
         audio_tick();
-        audio_probe_tick();
 
         u32 raw = read_pad();
         if (raw != prev_raw_logged) {
