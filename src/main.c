@@ -274,11 +274,6 @@ static void present(void) {
     total_frames++;
 }
 
-/* ---- video_init: cancel BOTH GS and IOP_SPU2 threads ----
-   The GS thread owns the display; the IOP/SPU2 thread owns the audio
-   pipeline.  If we only cancel GS, the emulator's audio thread keeps
-   calling sceAudioOutOpen / sceAudioOutOutput and holds the MAIN port,
-   so our own sceAudioOutOpen returns PORT_FULL. */
 static int video_init(u64 eboot) {
     void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
     if (cancel) {
@@ -372,10 +367,6 @@ static void query_real_user_id(void) {
     }
 }
 
-/* ---- audio_init_from: robust open with stale-handle cleanup and
-   multi-port fallback.  Sony reuses the 0x20000000-0x200000FF range
-   for audio handles; closing a guess that happens to be a live port
-   releases it, and a guess that isn't just returns an error. ---- */
 static void audio_init_from(void) {
     s32 amod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
                        (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
@@ -386,34 +377,35 @@ static void audio_init_from(void) {
     if (!a_open || !a_out) { printf("audio: syms missing\n"); return; }
     g_aud_close_fn = a_close;
 
-    /* Best effort: close any leftover handle from a previous session
-       that ran in the same process (LuaC0re doesn't tear down the host
-       process between payload launches). */
     if (a_close) {
         int released = 0;
-        for (u64 guess = 0x20000001ULL; guess <= 0x20000020ULL; guess++) {
+        for (u64 guess = 0x20000001ULL; guess <= 0x20000100ULL; guess++) {
             s32 r = (s32)NC(G, a_close, guess, 0,0,0,0,0);
-            if (r == 0) { released++; printf("audio: released stale 0x%llx\n",
-                                            (unsigned long long)guess); }
+            if (r == 0) released++;
         }
-        if (released) sleep_ms(150);
+        if (released) {
+            printf("audio: released %d stale handles\n", released);
+            sleep_ms(150);
+        }
     }
 
-    /* Try each (userId, portType) combination until one opens.
-       portType 0 = MAIN, 1 = BGM, 2 = VOICE, 4 = PADSPK (DualSense). */
     struct { s32 user, type; } tries[] = {
         { g_user_id, 0 },
         { 0xFF,      0 },
         { g_user_id, 1 },
         { 0xFF,      1 },
-        { g_user_id, 2 },
-        { 0xFF,      2 },
         { g_user_id, 4 },
         { 0xFF,      4 },
+        { g_user_id, 5 },
+        { 0xFF,      5 },
+        { g_user_id, 3 },
+        { 0xFF,      3 },
+        { g_user_id, 2 },
+        { 0xFF,      2 },
     };
 
     s32 h = -1;
-    for (int i = 0; i < 8 && h < 0; i++) {
+    for (int i = 0; i < 12 && h < 0; i++) {
         h = (s32)NC(G, a_open,
                     (u64)(s64)tries[i].user,
                     (u64)(s64)tries[i].type,
