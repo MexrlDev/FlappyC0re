@@ -10,7 +10,7 @@ CFLAGS := -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
           -Os -Wall -Wextra -Wno-unused-parameter \
           -I src
 
-LDFLAGS := -T linker.ld -nostdlib -static -no-pie -Wl,--emit-relocs
+LDFLAGS := -T linker.ld -nostdlib -static -no-pie --emit-relocs
 
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:src/%.c=build/%.o)
