@@ -1,70 +1,94 @@
-/* SPDX-License-Identifier: MIT */
 #ifndef CORE_H
 #define CORE_H
 
-typedef unsigned long  u64;
-typedef unsigned int   u32;
-typedef unsigned short u16;
-typedef unsigned char  u8;
-typedef long           s64;
-typedef int            s32;
-typedef short          s16;
-typedef signed char    s8;
+typedef __UINT8_TYPE__   u8;
+typedef __UINT16_TYPE__  u16;
+typedef __UINT32_TYPE__  u32;
+typedef __UINT64_TYPE__  u64;
 
-typedef u64 size_t;
-typedef s64 ssize_t;
-typedef s64 ptrdiff_t;
+typedef __INT8_TYPE__    s8;
+typedef __INT16_TYPE__   s16;
+typedef __INT32_TYPE__   s32;
+typedef __INT64_TYPE__   s64;
 
-#define NULL ((void*)0)
+typedef __SIZE_TYPE__    usize;
+typedef __PTRDIFF_TYPE__ isize;
+typedef __SIZE_TYPE__    size_t;
+typedef __PTRDIFF_TYPE__ ssize_t;
+typedef __PTRDIFF_TYPE__ ptrdiff_t;
 
-#define GADGET_OFFSET    0x31AA9
-#define LIBKERNEL_HANDLE 0x2001
+#ifndef NULL
+#  define NULL ((void *)0)
+#endif
 
-#define EBOOT_GS_THREAD  0x057F89B0
-#define EBOOT_VIDOUT     0x02d695d0
-#define EBOOT_SAVEDATA_MOUNT_GOT 0x3893F0
+#define HOST_GATE_OFF        0x31AA9u
+#define HOST_KERNEL_HANDLE   0x2001
+#define HOST_OFF_GS_THREAD   0x057F89B0u
+#define HOST_OFF_VIDEO_OUT   0x02d695d0u
+#define HOST_OFF_SAVEDATA    0x003893F0u
 
-#define SCR_W 1920
-#define SCR_H 1080
-#define FB_SIZE    (SCR_W * SCR_H * 4)
-#define FB_ALIGNED ((FB_SIZE + 0x1FFFFF) & ~0x1FFFFF)
-#define FB_TOTAL   (FB_ALIGNED * 2)
+#define SCREEN_W   1920
+#define SCREEN_H   1080
 
-#define SAMPLE_RATE     48000
-#define AUDIO_S16_STEREO 1
+#define FRAME_BYTES   (SCREEN_W * SCREEN_H * 4)
+#define FRAME_STRIDE  ((FRAME_BYTES + 0x1FFFFF) & ~0x1FFFFF)
+#define FRAME_TOTAL   (FRAME_STRIDE * 2)
 
-__attribute__((naked))
-static u64 native_call(void *gadget, void *fn,
-                       u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6)
+#define AUDIO_RATE      48000u
+#define AUDIO_FMT_S16   1
+
+__attribute__((naked, noinline))
+static u64 nc_call_gate(void *gate, void *target,
+                        u64 a0, u64 a1, u64 a2,
+                        u64 a3, u64 a4, u64 a5)
 {
-    __asm__ volatile (
-        "pushq %%rbx\n\t"
-        "movq %%rsi, %%rbx\n\t"
-        "movq %%rdi, %%rax\n\t"
-        "movq %%rdx, %%rdi\n\t"
-        "movq %%rcx, %%rsi\n\t"
-        "movq %%r8,  %%rdx\n\t"
-        "movq %%r9,  %%rcx\n\t"
-        "movq 16(%%rsp), %%r8\n\t"
-        "movq 24(%%rsp), %%r9\n\t"
-        "callq *%%rax\n\t"
-        "popq %%rbx\n\t"
-        "retq" ::: "memory"
+    __asm__ volatile(
+        "pushq  %%rbx\n\t"
+        "movq   %%rsi, %%rbx\n\t"
+        "movq   %%rdi, %%rax\n\t"
+        "movq   %%rdx, %%rdi\n\t"
+        "movq   %%rcx, %%rsi\n\t"
+        "movq   %%r8,  %%rdx\n\t"
+        "movq   %%r9,  %%rcx\n\t"
+        "movq   16(%%rsp), %%r8\n\t"
+        "movq   24(%%rsp), %%r9\n\t"
+        "callq  *%%rax\n\t"
+        "popq   %%rbx\n\t"
+        "retq"
+        ::: "memory"
     );
 }
 
 __attribute__((unused))
-static void *resolve_sym(void *gadget, void *dlsym_fn, s32 handle,
-                         const char *name)
+static void *nc_sym_lookup(void *gate, void *dlsym,
+                           s32 module, const char *name)
 {
-    void *addr = 0;
-    native_call(gadget, dlsym_fn, (u64)handle, (u64)name, (u64)&addr, 0, 0, 0);
-    return addr;
+    void *out = NULL;
+    nc_call_gate(gate, dlsym,
+                 (u64)(s64)module,
+                 (u64)name,
+                 (u64)&out,
+                 0, 0, 0);
+    return out;
 }
 
-#define NC  native_call
-#define SYM resolve_sym
+#define NC   nc_call_gate
+#define SYM  nc_sym_lookup
 
-#define PERSIST __attribute__((section(".ps_persist")))
+#define GADGET_OFFSET     HOST_GATE_OFF
+#define LIBKERNEL_HANDLE  HOST_KERNEL_HANDLE
+#define EBOOT_GS_THREAD   HOST_OFF_GS_THREAD
+#define EBOOT_VIDOUT      HOST_OFF_VIDEO_OUT
+#define EBOOT_SAVEDATA_MOUNT_GOT  HOST_OFF_SAVEDATA
 
-#endif
+#define SCR_W             SCREEN_W
+#define SCR_H             SCREEN_H
+#define FB_SIZE           FRAME_BYTES
+#define FB_ALIGNED        FRAME_STRIDE
+#define FB_TOTAL          FRAME_TOTAL
+#define SAMPLE_RATE       AUDIO_RATE
+#define AUDIO_S16_STEREO  AUDIO_FMT_S16
+
+#define PERSIST  __attribute__((section(".ps_persist")))
+
+#endif /* CORE_H */
