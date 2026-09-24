@@ -373,8 +373,7 @@ static void audio_init_from(void) {
     if (!a_open || !a_out) { printf("audio: syms missing\n"); return; }
     g_aud_close_fn = a_close;
 
-    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 2048, SAMPLE_RATE, AUDIO_S16_STEREO);
-    if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
+    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 512, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 256, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) { printf("audio: open failed %d\n", h); return; }
@@ -744,7 +743,17 @@ static void *audio_thread_entry(void *arg) {
         if (self) NC(G, setprio, self, 100, 0, 0, 0, 0);
     }
 
-    while (g_audio_running) audio_pump();
+    void *usleep = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelUsleep");
+
+    while (g_audio_running) {
+        if (!audio_is_active()) {
+            /* No device — sleep 30 ms so we don't burn CPU.  Without
+               this the thread spins at 100% and starves the renderer. */
+            if (usleep) NC(G, usleep, 30000, 0,0,0,0,0);
+            continue;
+        }
+        audio_pump();
+    }
     return 0;
 }
 
