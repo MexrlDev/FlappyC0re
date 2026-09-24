@@ -437,13 +437,14 @@ static const char *menu_items[] = {
     "DIFFICULTY",
     "BACKGROUND",
     "VIBRATION",
+    "SFX",
     "SCREEN",
     "RESET SCORE",
     "SAVE STATUS",
     "CREDITS",
     "EXIT",
 };
-#define MENU_COUNT 9
+#define MENU_COUNT 10
 
 static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
@@ -473,7 +474,7 @@ static void draw_menu(void) {
     render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
     render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
 
-    int base_y = 340;
+    int base_y = 320;
     for (int i = 0; i < MENU_COUNT; i++) {
         char line[64];
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
@@ -488,19 +489,25 @@ static void draw_menu(void) {
             snprintf(line, sizeof(line), "VIBRATION: %s", game.vibration_on ? "ON" : "OFF");
             text = line;
         } else if (i == 4) {
-            snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
+            if      (game.sfx_volume == 100) snprintf(line, sizeof(line), "SFX: ON");
+            else if (game.sfx_volume == 0)   snprintf(line, sizeof(line), "SFX: OFF");
+            else                              snprintf(line, sizeof(line), "SFX: %u%%",
+                                                         (unsigned)game.sfx_volume);
             text = line;
         } else if (i == 5) {
-            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
             text = line;
         } else if (i == 6) {
+            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            text = line;
+        } else if (i == 7) {
             snprintf(line, sizeof(line), "SAVE: %s",
                      save_available() ? "OK" : "NO SAVEDATA");
             text = line;
         }
         if (i == game.menu_cursor)
-            render_text(160, base_y + i * 60 - 6, ">", col, 4);
-        render_text(240, base_y + i * 60, text, col, 4);
+            render_text(160, base_y + i * 56 - 6, ">", col, 4);
+        render_text(240, base_y + i * 56, text, col, 4);
     }
 
     render_text(40, 940, "X: SELECT   O: BACK", 0xFF808080u, 3);
@@ -597,6 +604,13 @@ static void menu_update(u32 pressed) {
             haptic_apply_toggle();
             save_write(&game);
         } else if (game.menu_cursor == 4) {
+            int v = (int)game.sfx_volume + dir * 5;
+            if (v < 0)   v = 0;
+            if (v > 100) v = 100;
+            game.sfx_volume = (u8)v;
+            audio_set_master(game.sfx_volume);
+            save_write(&game);
+        } else if (game.menu_cursor == 5) {
             int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
             game.screen_mode = (enum screen_mode)m;
             save_write(&game);
@@ -620,21 +634,26 @@ static void menu_update(u32 pressed) {
             save_write(&game);
             break;
         case 4:
+            game.sfx_volume = (game.sfx_volume == 0) ? 100 : 0;
+            audio_set_master(game.sfx_volume);
+            save_write(&game);
+            break;
+        case 5:
             game.screen_mode = (enum screen_mode)
                 ((game.screen_mode + 1) % SCREEN_MODE_COUNT);
             save_write(&game);
             break;
-        case 5:
+        case 6:
             game.high_score = 0;
             game.last_score = 0;
             save_write(&game);
             break;
-        case 6:
-            break;
         case 7:
-            game.show_credits = 1;
             break;
         case 8:
+            game.show_credits = 1;
+            break;
+        case 9:
             save_write(&game);
             g_exit_now = 1;
             break;
@@ -722,12 +741,7 @@ static void *audio_thread_entry(void *arg) {
     void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
     if (self_fn && setprio) {
         u64 self = NC(G, self_fn, 0,0,0,0,0,0);
-        if (self) {
-            /* Lower number = higher priority on Sony's scheduler.
-               100 gives the audio thread comfortable headroom over the
-               renderer, eliminating underruns during heavy frames. */
-            NC(G, setprio, self, 100, 0, 0, 0, 0);
-        }
+        if (self) NC(G, setprio, self, 100, 0, 0, 0, 0);
     }
 
     while (g_audio_running) audio_pump();
@@ -847,15 +861,17 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     save_init();
     game_init(&game);
     game.vibration_on = 1;
+    game.sfx_volume   = 100;
     save_load(&game);
+    audio_set_master(game.sfx_volume);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
-    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s\n",
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u\n",
            nreloc, video_h, pad_h,
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), (int)g_user_id,
-           game_screen_name(game.screen_mode));
+           game_screen_name(game.screen_mode), (unsigned)game.sfx_volume);
 
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
