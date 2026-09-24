@@ -12,7 +12,14 @@ void render_swap(void);
 
 u32 *render_fb(void);
 
-void render_clear(u32 argb);
+/* Viewport transform — applies to all subsequent blits and text draws.
+   scale is 1.0 for full screen, smaller for letterboxed modes. */
+void render_set_viewport(float scale, int offx, int offy);
+int  render_viewport_w(void);
+int  render_viewport_h(void);
+
+void render_clear(u32 argb);       /* clears the viewport only */
+void render_clear_full(u32 argb);  /* clears the entire framebuffer */
 void render_fill_rect(int x, int y, int w, int h, u32 argb);
 void render_blit_scaled(int asset, float x, float y, float scale, u8 alpha);
 void render_blit_scaled_bg(int asset, float x, float scale);
