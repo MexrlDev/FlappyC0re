@@ -35,6 +35,8 @@ PERSIST static void *g_aud_mod      = 0;
 
 PERSIST static u8 g_aud_actual_port = 0;
 
+PERSIST static s32 g_pad_mod = -1;
+
 PERSIST static u32 g_pad_fails = 0;
 
 static void early_send(u64 eboot, void *dlsym, s32 log_fd,
@@ -381,19 +383,14 @@ static s32 try_open_audio_port(s32 user, s32 type) {
                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
 }
 
-/* Sweep only the handle ranges that our supported ports use:
-   TV      -> 0x2000_xxxx
-   HEADSET -> 0x2003_xxxx
-   Also BGM/VOICE prefixes so any earlier leak is cleaned up too.
-   Total: 4 prefixes * 0x40 slots = 256 iterations (~30 ms). */
 static int audio_sweep_stale_handles(void) {
     if (!g_aud_close_fn) return 0;
     int released = 0;
     static const u64 prefixes[] = {
-        0x20000000ULL,   /* TV       */
-        0x20010000ULL,   /* BGM      */
-        0x20020000ULL,   /* VOICE    */
-        0x20030000ULL,   /* HEADSET  */
+        0x20000000ULL,
+        0x20010000ULL,
+        0x20020000ULL,
+        0x20030000ULL,
     };
     for (int p = 0; p < 4; p++) {
         for (u64 i = 1; i <= 0x40; i++) {
@@ -405,7 +402,6 @@ static int audio_sweep_stale_handles(void) {
     return released;
 }
 
-/* Only TV (0) and HEADSET (3) are supported. */
 #define PORT_TV       0
 #define PORT_HEADSET  3
 
@@ -516,6 +512,7 @@ static void pad_init_from(void) {
     s32 pmod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
                        (u64)"libScePad.sprx", 0,0,0,0,0);
     if (pmod < 0) { printf("pad_init: load libScePad failed %d\n", pmod); return; }
+    g_pad_mod = pmod;
 
     void *p_init = SYM(G, D, pmod, "scePadInit");
     void *p_geth = SYM(G, D, pmod, "scePadGetHandle");
@@ -560,6 +557,94 @@ static void pad_init_from(void) {
            pad_h, (void*)pad_lb_fn);
 }
 
+static void run_audio_diagnostic(void) {
+    printf("diag: ===== AUDIO DIAGNOSTIC START =====\n");
+    printf("diag: pad_mod=%d aud_mod=%d\n",
+           g_pad_mod, (s32)(s64)g_aud_mod);
+
+    static const char *pad_syms[] = {
+        "scePadSetAudioOut",
+        "scePadAudioOutOpen",
+        "scePadAudioOutClose",
+        "scePadAudioOutOutput",
+        "scePadSetAudioOutput",
+        "scePadSetAudioRoute",
+        "scePadSetAudioDevice",
+        "scePadSetAudioControl",
+        "scePadSetSpeaker",
+        "scePadSetSpeakerMode",
+        "scePadSetSpeakerVolume",
+        "scePadSetVoiceOutput",
+        "scePadGetAudioOutState",
+        "scePadGetSpeakerState",
+        "scePadSetVibration",
+        "scePadSetLightBar",
+        "scePadSetTriggerEffect",
+        "scePadResetOrientation",
+        "scePadSetMotionSensorState",
+        "scePadSetTiltCorrectionState",
+        "scePadSetAngularVelocityDeadbandState",
+        "scePadGetControllerInformation",
+        "scePadGetExtControllerInformation",
+        "scePadGetDeviceInfo",
+        "scePadGetDeviceInfoForPadHandle",
+        "scePadGetConnectionState",
+        "scePadGetHandleForDevice",
+        "scePadSetVibrationMode",
+        "scePadGetFeatureReport",
+        "scePadSetFeatureReport",
+        "scePadDeviceClassGetExtendedDeviceInfo",
+        "scePadDeviceClassGetDeviceClass",
+        "scePadDeviceClassGetExtendedData",
+    };
+    int n_sym = (int)(sizeof(pad_syms) / sizeof(pad_syms[0]));
+    printf("diag: probing %d libScePad symbols\n", n_sym);
+    for (int i = 0; i < n_sym; i++) {
+        void *fn = g_pad_mod > 0
+            ? SYM(G, D, g_pad_mod, pad_syms[i])
+            : 0;
+        printf("diag: pad  %-40s %p\n", pad_syms[i], fn);
+    }
+
+    static const char *aud_syms[] = {
+        "sceAudioOutOpen",
+        "sceAudioOutClose",
+        "sceAudioOutOutput",
+        "sceAudioOutOutputs",
+        "sceAudioOutSetVolume",
+        "sceAudioOutSetMixLevelPadSpk",
+        "sceAudioOutSetMixLevel",
+        "sceAudioOutGetPortState",
+        "sceAudioOutInit",
+        "sceAudioOutGetSystemState",
+        "sceAudioOutSetCompressor",
+        "sceAudioOutSetPadSpeakerVolume",
+    };
+    int n_aud = (int)(sizeof(aud_syms) / sizeof(aud_syms[0]));
+    printf("diag: probing %d libSceAudioOut symbols\n", n_aud);
+    s32 amod = (s32)(s64)g_aud_mod;
+    for (int i = 0; i < n_aud; i++) {
+        void *fn = amod > 0 ? SYM(G, D, amod, aud_syms[i]) : 0;
+        printf("diag: aud  %-40s %p\n", aud_syms[i], fn);
+    }
+
+    if (g_aud_open_fn && g_aud_close_fn) {
+        printf("diag: port sweep 0..15\n");
+        for (s32 type = 0; type < 16; type++) {
+            s32 h = (s32)NC(G, g_aud_open_fn,
+                            (u64)(s64)g_user_id, (u64)(s64)type,
+                            0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
+            printf("diag: open type=%2d -> %10d (0x%08x)\n",
+                   (int)type, (int)h, (unsigned)h);
+            if (h >= 0) {
+                NC(G, g_aud_close_fn, (u64)h, 0,0,0,0,0);
+            }
+        }
+    }
+
+    printf("diag: ===== AUDIO DIAGNOSTIC END =====\n");
+}
+
 static const char *menu_items[] = {
     "START GAME",
     "DIFFICULTY",
@@ -570,10 +655,11 @@ static const char *menu_items[] = {
     "SCREEN",
     "RESET SCORE",
     "SAVE STATUS",
+    "AUDIO DIAGNOSTIC",
     "CREDITS",
     "EXIT",
 };
-#define MENU_COUNT 11
+#define MENU_COUNT 12
 
 static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
@@ -603,8 +689,8 @@ static void draw_menu(void) {
     render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
     render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
 
-    int base_y = 310;
-    int step   = 52;
+    int base_y = 300;
+    int step   = 48;
     for (int i = 0; i < MENU_COUNT; i++) {
         char line[64];
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
@@ -795,9 +881,12 @@ static void menu_update(u32 pressed) {
         case 8:
             break;
         case 9:
-            game.show_credits = 1;
+            run_audio_diagnostic();
             break;
         case 10:
+            game.show_credits = 1;
+            break;
+        case 11:
             save_write(&game);
             g_exit_now = 1;
             break;
@@ -966,6 +1055,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_out_fn      = 0;
     g_aud_mod         = 0;
     g_aud_actual_port = 0;
+    g_pad_mod         = -1;
     g_pad_fails       = 0;
     pad_prev          = 0;
     haptic_until_ms   = 0;
@@ -1019,7 +1109,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game.audio_port   = PORT_TV;
     save_load(&game);
 
-    /* Only allow the two supported ports; anything else falls back to TV. */
     if (!port_is_valid(game.audio_port)) game.audio_port = PORT_TV;
 
     audio_set_master(game.sfx_volume);
