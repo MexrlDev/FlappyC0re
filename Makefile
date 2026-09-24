@@ -11,13 +11,19 @@ CFLAGS := -m64 -ffreestanding -nostdinc -fPIE \
           -fno-asynchronous-unwind-tables -fno-unwind-tables \
           -mno-red-zone -fno-omit-frame-pointer \
           -Os -Wall -Wextra -Wno-unused-parameter \
-          -I$(SRC_DIR)
+          -I $(SRC_DIR)
 
 LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie \
            -Wl,-T,$(CURDIR)/linker.ld -Wl,--build-id=none
 
-SRCS := $(wildcard $(SRC_DIR)/*.c)
-OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SRCS))
+# ---- Sources ----
+# .S is picked up so the generated assets.S (from bake_assets.py) is
+# assembled into the final binary.  If bake_assets.py does not emit a
+# .S file, the wildcard simply returns nothing and the build proceeds.
+SRCS_C := $(wildcard $(SRC_DIR)/*.c)
+SRCS_S := $(wildcard $(SRC_DIR)/*.S)
+OBJS   := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SRCS_C)) \
+          $(patsubst $(SRC_DIR)/%.S,$(BUILD)/%.o,$(SRCS_S))
 
 .PHONY: all clean hex assets font
 
@@ -26,7 +32,12 @@ all: $(NAME).bin
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-$(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
+# C sources depend on assets.h so a fresh bake triggers a rebuild.
+$(BUILD)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/assets.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Assembly (the generated assets.S) goes through gcc too.
+$(BUILD)/%.o: $(SRC_DIR)/%.S | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(NAME).elf: $(OBJS) linker.ld
