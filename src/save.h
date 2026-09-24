@@ -4,7 +4,7 @@
 #include "game.h"
 
 #define SAVE_PATH "/savedata0/.savegame/flappy.sav"
-#define SAVE_VERSION 3
+#define SAVE_VERSION 4
 
 struct save_blob {
     u32 magic;
@@ -16,6 +16,7 @@ struct save_blob {
     u32 is_night;
     u32 vibration_on;
     u32 screen_mode;
+    u32 sfx_volume;
     u32 checksum;
 };
 
