@@ -73,8 +73,10 @@ static void *nc_sym_lookup(void *gate, void *dlsym,
     return out;
 }
 
-#define NC   nc_call_gate
-#define SYM  nc_sym_lookup
+#define NC             nc_call_gate
+#define SYM            nc_sym_lookup
+#define native_call    nc_call_gate
+#define resolve_sym    nc_sym_lookup
 
 #define GADGET_OFFSET     HOST_GATE_OFF
 #define LIBKERNEL_HANDLE  HOST_KERNEL_HANDLE
