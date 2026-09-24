@@ -3,11 +3,11 @@
 
 extern const u8 asset_blob[];
 
-#define NUM_VOICES 32
-#define GRAIN      1024
-
-#define FADE_IN_LEN   128
-#define FADE_OUT_LEN   96
+#define NUM_VOICES     32
+#define GRAIN          1024
+#define FADE_IN_LEN    128
+#define FADE_OUT_LEN    96
+#define KILL_FADE_LEN  256
 
 struct voice {
     const s16 *pcm;
@@ -15,6 +15,7 @@ struct voice {
     u32 pos;
     float vol;
     u8  active;
+    u32 kill_countdown;
 };
 
 PERSIST static struct voice voices[NUM_VOICES];
@@ -22,7 +23,6 @@ PERSIST static s32 audio_handle = -1;
 PERSIST static void *audio_out_fn;
 PERSIST static void *gadget;
 PERSIST static s16 mix_buf[GRAIN * 2];
-
 PERSIST static u8 audio_master = 100;
 
 void audio_set_master(u8 v) {
@@ -38,8 +38,10 @@ int audio_init(s32 h, void *fn, void *G) {
     audio_handle = h;
     audio_out_fn = fn;
     gadget = G;
-    for (int i = 0; i < NUM_VOICES; i++) voices[i].active = 0;
-
+    for (int i = 0; i < NUM_VOICES; i++) {
+        voices[i].active = 0;
+        voices[i].kill_countdown = 0;
+    }
     if (h >= 0 && fn) {
         static s16 silence[GRAIN * 2];
         for (int i = 0; i < GRAIN * 2; i++) silence[i] = 0;
@@ -50,7 +52,10 @@ int audio_init(s32 h, void *fn, void *G) {
 }
 
 void audio_shutdown(void) {
-    for (int i = 0; i < NUM_VOICES; i++) voices[i].active = 0;
+    for (int i = 0; i < NUM_VOICES; i++) {
+        voices[i].active = 0;
+        voices[i].kill_countdown = 0;
+    }
     audio_handle = -1;
 }
 
@@ -63,15 +68,14 @@ void audio_play(enum asset_id id, float vol) {
 
     const s16 *pcm = (const s16*)(asset_blob + a->offset);
 
-    for (int i = 0; i < NUM_VOICES; i++) {
-        if (voices[i].active && voices[i].pcm == pcm) {
-            voices[i].active = 0;
-        }
-    }
-
     int slot = -1;
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!voices[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < NUM_VOICES; i++) {
+            if (voices[i].kill_countdown > 0) { slot = i; break; }
+        }
     }
     if (slot < 0) {
         u32 oldest = 0;
@@ -81,11 +85,19 @@ void audio_play(enum asset_id id, float vol) {
     }
     if (slot < 0) return;
 
-    voices[slot].pcm    = pcm;
-    voices[slot].len    = a->h;
-    voices[slot].pos    = 0;
-    voices[slot].vol    = vol;
-    voices[slot].active = 1;
+    for (int i = 0; i < NUM_VOICES; i++) {
+        if (i == slot) continue;
+        if (voices[i].active && voices[i].pcm == pcm && voices[i].kill_countdown == 0) {
+            voices[i].kill_countdown = KILL_FADE_LEN;
+        }
+    }
+
+    voices[slot].pcm            = pcm;
+    voices[slot].len            = a->h;
+    voices[slot].pos            = 0;
+    voices[slot].vol            = vol;
+    voices[slot].active         = 1;
+    voices[slot].kill_countdown = 0;
 }
 
 static inline int soft_clip(int x) {
@@ -114,6 +126,7 @@ void audio_mix_tick(void) {
             if (!voices[v].active) continue;
             if (voices[v].pos >= voices[v].len) {
                 voices[v].active = 0;
+                voices[v].kill_countdown = 0;
                 continue;
             }
 
@@ -128,6 +141,17 @@ void audio_mix_tick(void) {
             u32 rem = len - pos;
             if (rem < FADE_OUT_LEN)
                 gain *= (float)rem / (float)FADE_OUT_LEN;
+
+            if (voices[v].kill_countdown > 0) {
+                gain *= (float)voices[v].kill_countdown / (float)KILL_FADE_LEN;
+                voices[v].kill_countdown--;
+                if (voices[v].kill_countdown == 0) {
+                    voices[v].pos++;
+                    acc += (int)(sample * gain);
+                    voices[v].active = 0;
+                    continue;
+                }
+            }
 
             voices[v].pos++;
             acc += (int)(sample * gain);
