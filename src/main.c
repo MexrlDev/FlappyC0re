@@ -24,6 +24,12 @@ PERSIST static void *G, *D;
 PERSIST static s32 g_user_id = 1;
 PERSIST static volatile int g_exit_now = 0;
 
+/* ---- audio thread control (so we can stop it on exit) ---- */
+PERSIST static volatile int g_audio_running = 0;
+PERSIST static u64 g_audio_tid = 0;
+PERSIST static s32 g_aud_handle = -1;
+PERSIST static void *g_aud_close_fn = 0;
+
 /* ---------------- early diagnostic ---------------- */
 
 static void early_send(u64 eboot, void *dlsym, s32 log_fd,
@@ -158,13 +164,6 @@ static u32 read_pad(void) {
     u32 raw = *(u32*)pad_buf;
     if (raw & 0x80000000u) return 0;
     return raw & 0x001FFFFFu;
-}
-
-static u32 pad_pressed(void) {
-    u32 cur = read_pad();
-    u32 p = cur & ~pad_prev;
-    pad_prev = cur;
-    return p;
 }
 
 /* ---------------- lightbar ---------------- */
@@ -332,13 +331,20 @@ static void query_real_user_id(void) {
 static void audio_init_from(void) {
     s32 amod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
                        (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
-    if (amod < 0) return;
+    if (amod < 0) { printf("audio: load libSceAudioOut failed\n"); return; }
     void *a_open  = SYM(G, D, amod, "sceAudioOutOpen");
     void *a_out   = SYM(G, D, amod, "sceAudioOutOutput");
-    if (!a_open || !a_out) return;
-    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 2048, SAMPLE_RATE, AUDIO_S16_STEREO);
+    void *a_close = SYM(G, D, amod, "sceAudioOutClose");
+    if (!a_open || !a_out) { printf("audio: syms missing\n"); return; }
+    g_aud_close_fn = a_close;
+
+    s32 h = (s32)NC(G, a_open, 0xFF, 0, 0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 512, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (h < 0) h = (s32)NC(G, a_open, 0xFF, 0, 0, 256, SAMPLE_RATE, AUDIO_S16_STEREO);
+    if (h < 0) { printf("audio: open failed %d\n", h); return; }
+
+    printf("audio: handle=%d close=%p\n", h, (void*)a_close);
+    g_aud_handle = h;
     audio_init(h, a_out, G);
 }
 
@@ -471,15 +477,12 @@ static void draw_menu(void) {
 static void draw_playing(void) {
     int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
 
-    /* Background tiles: enough copies to cover 1920 px.
-       bg_scroll is in [-BG_W, 0]. */
-    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 1;   /* ~4-5 */
+    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 1;
     for (int i = 0; i < bg_copies; i++) {
         render_blit_scaled_bg_fp(bg, game.bg_scroll + (float)(i * BG_W),
                                  GAME_SCALE_FP);
     }
 
-    /* Pipes — top pipe bottom edge sits at p->y_top, bottom pipe top at p->y_bot */
     for (int i = 0; i < game.active_count; i++) {
         struct pipe_pair *p = game.active[i];
         render_blit_scaled_fp(A_PIPE_TOP, p->x, p->y_top - (float)PIPE_H,
@@ -488,8 +491,7 @@ static void draw_playing(void) {
                               GAME_SCALE_FP, 255);
     }
 
-    /* Ground / base tiles */
-    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 1;   /* ~4 */
+    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 1;
     for (int i = 0; i < base_copies; i++) {
         render_blit_scaled_fp(A_BASE,
                               game.base_scroll + (float)(i * BASE_W),
@@ -497,14 +499,12 @@ static void draw_playing(void) {
                               GAME_SCALE_FP, 255);
     }
 
-    /* Bird */
     int bird_asset = A_BIRD_MID;
     if (game.bird_vy < -120.0f)      bird_asset = A_BIRD_UP;
     else if (game.bird_vy > 120.0f)  bird_asset = A_BIRD_DOWN;
     render_blit_scaled_fp(bird_asset, BIRD_X_POS, game.bird_y,
                           GAME_SCALE_FP, 255);
 
-    /* Score text */
     char s[32];
     snprintf(s, sizeof(s), "SCORE: %d", game.score);
     render_text(40, 40, s, 0xFFFFFFFFu, 5);
@@ -514,10 +514,9 @@ static void draw_playing(void) {
 
 /* ---- draw_gameover ---- */
 static void draw_gameover(void) {
-    /* GAME OVER banner image, centered horizontally at y ≈ 440 */
     int gx = (SCR_W - GAMEOVER_W) / 2;
     render_blit_scaled_fp(A_GAMEOVER, (float)gx, (float)(SCR_H / 2 - 100),
-                          384 /* 1.5 * 256 */, 255);
+                          384, 255);
 
     char s[64];
     snprintf(s, sizeof(s), "SCORE: %d", game.score);
@@ -667,24 +666,58 @@ static void audio_pump(void) { audio_mix_tick(); }
 
 static void *audio_thread_entry(void *arg) {
     (void)arg;
-    for (;;) audio_pump();
+
+    /* Ask for a higher priority so the renderer can't starve us. */
+    void *self_fn = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSelf");
+    void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
+    if (self_fn && setprio) {
+        u64 self = NC(G, self_fn, 0,0,0,0,0,0);
+        if (self) NC(G, setprio, self, 200, 0, 0, 0, 0);
+    }
+
+    /* Run until told to stop. */
+    while (g_audio_running) audio_pump();
     return 0;
 }
 
 /* ---------------- cleanup ---------------- */
 
 static void cleanup_and_return(struct ext_args_lua *ext) {
+    /* 1. Stop the audio thread FIRST — otherwise it keeps calling
+       sceAudioOutOutput on a device we're about to close, and the
+       next session starts with a wedged audio pipeline. */
+    g_audio_running = 0;
+    sleep_ms(100);
+
+    /* Hard-cancel in case it's blocked inside sceAudioOutOutput. */
+    void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
+    if (cancel && g_audio_tid) {
+        NC(G, cancel, g_audio_tid, 0, 0, 0, 0, 0);
+        sleep_ms(30);
+    }
+    g_audio_tid = 0;
+
+    /* 2. Kill vibration */
     if (pad_h >= 0 && pad_vib_fn) {
         vib_data[0] = 0; vib_data[1] = 0;
         for (int i = 2; i < 8; i++) vib_data[i] = 0;
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
     }
 
+    /* 3. Restore Sony soft-blue lightbar */
     lightbar_apply(LB_DEFAULT);
     sleep_ms(80);
 
+    /* 4. Shut down audio, THEN close the device handle.  Without the
+       close, session 2's sceAudioOutOpen fails or hands back a bad
+       handle, and the second exit never completes. */
     audio_shutdown();
+    if (g_aud_close_fn && g_aud_handle >= 0) {
+        NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
+        g_aud_handle = -1;
+    }
 
+    /* 5. Blank the screen */
     if (fbs_mem) {
         u32 *fb0 = (u32*)fbs_mem;
         u32 *fb1 = (u32*)(fbs_mem + FB_ALIGNED);
@@ -694,12 +727,19 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
         sleep_ms(50);
     }
 
-    if (vid_close && video_h >= 0)
+    /* 6. Close video */
+    if (vid_close && video_h >= 0) {
         NC(G, vid_close, (u64)video_h, 0,0,0,0,0);
+        video_h = -1;
+    }
 
-    if (delete_eq && eq)
+    /* 7. Delete event queue */
+    if (delete_eq && eq) {
         NC(G, delete_eq, eq, 0,0,0,0,0);
+        eq = 0;
+    }
 
+    /* 8. Mark session as cleanly finished */
     ext->status = 0;
     ext->step   = 99;
     ext->frame  = (u32)total_frames;
@@ -709,6 +749,22 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
+    /* ---- Reset session-scoped globals FIRST.  The shellcode may be
+       loaded at the same mmap address as a previous run, so PERSIST
+       values from the previous session can leak in. ---- */
+    g_exit_now      = 0;
+    g_audio_running = 1;
+    g_audio_tid     = 0;
+    g_aud_handle    = -1;
+    g_aud_close_fn  = 0;
+    pad_prev        = 0;
+    haptic_until_ms = 0;
+    total_frames    = 0;
+    video_h         = -1;
+    fbs_mem         = 0;
+    eq              = 0;
+    last_gstate     = 0xFF;
+
     int nreloc = apply_relocations();
 
     G = (void*)(eboot + GADGET_OFFSET);
@@ -764,15 +820,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), (int)g_user_id);
 
-    /* ---- Layout report so you can sanity-check on-device ---- */
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
            BIRD_W, BIRD_H, GROUND_H, GAME_SCALE_FP);
 
     void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
     if (pc) {
-        u64 tid = 0;
-        NC(G, pc, (u64)&tid, 0,
+        NC(G, pc, (u64)&g_audio_tid, 0,
            (u64)(void*)audio_thread_entry, 0, (u64)"flap_aud", 0);
     }
 
@@ -791,7 +845,6 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         haptic_tick();
 
-        /* ---- Debug: log every raw pad change ---- */
         u32 raw = read_pad();
         if (raw != prev_raw_logged) {
             printf("PAD f=%u raw=%08x st=%d\n",
@@ -799,12 +852,20 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
             prev_raw_logged = raw;
         }
 
-        /* ---- Debug: periodic game state dump for the first ~10 s ---- */
-        if (total_frames < 600 && (total_frames % 30) == 0) {
-            printf("DBG f=%u st=%d bird_y=%.1f vy=%.1f pipes=%d spd=%.2f sc=%d\n",
-                   (unsigned)total_frames, (int)game.state,
-                   game.bird_y, game.bird_vy,
-                   game.active_count, game.pipe_speed, game.score);
+        {
+            static u32 max_dt_seen = 0;
+            if (dt_ms > max_dt_seen) max_dt_seen = dt_ms;
+            if (total_frames < 600 && (total_frames % 30) == 0) {
+                printf("DBG f=%u st=%d y=%d vy=%d pipes=%d spd=%d sc=%d maxdt=%u\n",
+                       (unsigned)total_frames, (int)game.state,
+                       (int)(game.bird_y * 10.0f),
+                       (int)game.bird_vy,
+                       game.active_count,
+                       (int)(game.pipe_speed * 100.0f),
+                       game.score,
+                       (unsigned)max_dt_seen);
+                max_dt_seen = 0;
+            }
         }
 
         u32 pressed = raw & ~pad_prev;
