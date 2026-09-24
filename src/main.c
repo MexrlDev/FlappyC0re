@@ -25,9 +25,13 @@ PERSIST static s32 g_user_id = 1;
 PERSIST static volatile int g_exit_now = 0;
 
 PERSIST static volatile int g_audio_running = 0;
+PERSIST static volatile int g_audio_pause   = 0;
 PERSIST static u64 g_audio_tid = 0;
 PERSIST static s32 g_aud_handle = -1;
 PERSIST static void *g_aud_close_fn = 0;
+PERSIST static void *g_aud_open_fn  = 0;
+PERSIST static void *g_aud_out_fn   = 0;
+PERSIST static void *g_aud_mod      = 0;
 
 PERSIST static u32 g_pad_fails = 0;
 
@@ -367,20 +371,33 @@ static void query_real_user_id(void) {
     }
 }
 
-static void audio_init_from(void) {
-    s32 amod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
-                       (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
-    if (amod < 0) { printf("audio: load libSceAudioOut failed\n"); return; }
-    void *a_open  = SYM(G, D, amod, "sceAudioOutOpen");
-    void *a_out   = SYM(G, D, amod, "sceAudioOutOutput");
-    void *a_close = SYM(G, D, amod, "sceAudioOutClose");
-    if (!a_open || !a_out) { printf("audio: syms missing\n"); return; }
-    g_aud_close_fn = a_close;
+static s32 try_open_audio_port(s32 user, s32 type) {
+    if (!g_aud_open_fn) return -1;
+    return (s32)NC(G, g_aud_open_fn,
+                   (u64)(s64)user,
+                   (u64)(s64)type,
+                   0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
+}
 
-    if (a_close) {
+static void audio_init_from(void) {
+    g_aud_mod = (void*)(s64)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
+                              (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
+    if ((s32)(s64)g_aud_mod < 0) {
+        printf("audio: load libSceAudioOut failed\n");
+        return;
+    }
+    g_aud_open_fn  = SYM(G, D, (s32)(s64)g_aud_mod, "sceAudioOutOpen");
+    g_aud_out_fn   = SYM(G, D, (s32)(s64)g_aud_mod, "sceAudioOutOutput");
+    g_aud_close_fn = SYM(G, D, (s32)(s64)g_aud_mod, "sceAudioOutClose");
+    if (!g_aud_open_fn || !g_aud_out_fn) {
+        printf("audio: syms missing\n");
+        return;
+    }
+
+    if (g_aud_close_fn) {
         int released = 0;
         for (u64 guess = 0x20000001ULL; guess <= 0x20000100ULL; guess++) {
-            s32 r = (s32)NC(G, a_close, guess, 0,0,0,0,0);
+            s32 r = (s32)NC(G, g_aud_close_fn, guess, 0,0,0,0,0);
             if (r == 0) released++;
         }
         if (released) {
@@ -389,27 +406,22 @@ static void audio_init_from(void) {
         }
     }
 
-    struct { s32 user, type; } tries[] = {
-        { g_user_id, 0 },
-        { 0xFF,      0 },
-        { g_user_id, 1 },
-        { 0xFF,      1 },
-        { g_user_id, 2 },
-        { 0xFF,      2 },
-        { g_user_id, 4 },
-        { 0xFF,      4 },
-        { g_user_id, 5 },
-        { 0xFF,      5 },
-        { g_user_id, 3 },
-        { 0xFF,      3 },
-    };
+    s32 preferred = (s32)game.audio_port;
+
+    struct { s32 user, type; } tries[16];
+    int n = 0;
+    tries[n].user = g_user_id; tries[n].type = preferred; n++;
+    tries[n].user = 0xFF;      tries[n].type = preferred; n++;
+
+    for (s32 t = 0; t < AUDIO_PORT_COUNT; t++) {
+        if (t == preferred) continue;
+        tries[n].user = g_user_id; tries[n].type = t; n++;
+        tries[n].user = 0xFF;      tries[n].type = t; n++;
+    }
 
     s32 h = -1;
-    for (int i = 0; i < 12 && h < 0; i++) {
-        h = (s32)NC(G, a_open,
-                    (u64)(s64)tries[i].user,
-                    (u64)(s64)tries[i].type,
-                    0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
+    for (int i = 0; i < n && h < 0; i++) {
+        h = try_open_audio_port(tries[i].user, tries[i].type);
         printf("audio: try user=%d type=%d -> %d (0x%08x)\n",
                tries[i].user, tries[i].type, h, (unsigned)h);
     }
@@ -419,9 +431,49 @@ static void audio_init_from(void) {
         return;
     }
 
-    printf("audio: handle=%d close=%p\n", h, (void*)a_close);
+    printf("audio: handle=%d close=%p\n", h, (void*)g_aud_close_fn);
     g_aud_handle = h;
-    audio_init(h, a_out, G);
+    audio_init(h, g_aud_out_fn, G);
+}
+
+static void audio_restart_with_port(u8 new_port) {
+    if (new_port >= AUDIO_PORT_COUNT) new_port = 0;
+    if (!g_aud_open_fn || !g_aud_close_fn) {
+        printf("audio: cannot restart - module not loaded\n");
+        return;
+    }
+
+    printf("audio: restart -> port %u (%s)\n",
+           (unsigned)new_port, game_audio_port_name(new_port));
+
+    g_audio_pause = 1;
+    sleep_ms(80);
+
+    if (g_aud_handle >= 0) {
+        NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
+        g_aud_handle = -1;
+    }
+    sleep_ms(60);
+
+    s32 h = try_open_audio_port(g_user_id, (s32)new_port);
+    if (h < 0) h = try_open_audio_port(0xFF, (s32)new_port);
+    if (h < 0) {
+        printf("audio: restart port %u failed, reverting\n",
+               (unsigned)new_port);
+        h = try_open_audio_port(g_user_id, (s32)game.audio_port);
+        if (h < 0) h = try_open_audio_port(0xFF, (s32)game.audio_port);
+        if (h < 0) {
+            printf("audio: revert also failed - silent\n");
+            g_audio_pause = 0;
+            return;
+        }
+    } else {
+        game.audio_port = new_port;
+    }
+
+    g_aud_handle = h;
+    audio_init(h, g_aud_out_fn, G);
+    g_audio_pause = 0;
 }
 
 static void pad_init_from(void) {
@@ -478,13 +530,14 @@ static const char *menu_items[] = {
     "BACKGROUND",
     "VIBRATION",
     "SFX",
+    "AUDIO OUTPUT",
     "SCREEN",
     "RESET SCORE",
     "SAVE STATUS",
     "CREDITS",
     "EXIT",
 };
-#define MENU_COUNT 10
+#define MENU_COUNT 11
 
 static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
@@ -514,7 +567,8 @@ static void draw_menu(void) {
     render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
     render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
 
-    int base_y = 320;
+    int base_y = 310;
+    int step   = 52;
     for (int i = 0; i < MENU_COUNT; i++) {
         char line[64];
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
@@ -535,19 +589,23 @@ static void draw_menu(void) {
                                                          (unsigned)game.sfx_volume);
             text = line;
         } else if (i == 5) {
-            snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
+            snprintf(line, sizeof(line), "AUDIO OUTPUT: %s",
+                     game_audio_port_name(game.audio_port));
             text = line;
         } else if (i == 6) {
-            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
             text = line;
         } else if (i == 7) {
+            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            text = line;
+        } else if (i == 8) {
             snprintf(line, sizeof(line), "SAVE: %s",
                      save_available() ? "OK" : "NO SAVEDATA");
             text = line;
         }
         if (i == game.menu_cursor)
-            render_text(160, base_y + i * 56 - 6, ">", col, 4);
-        render_text(240, base_y + i * 56, text, col, 4);
+            render_text(160, base_y + i * step - 6, ">", col, 4);
+        render_text(240, base_y + i * step, text, col, 4);
     }
 
     render_text(40, 940, "X: SELECT   O: BACK", 0xFF808080u, 3);
@@ -651,6 +709,11 @@ static void menu_update(u32 pressed) {
             audio_set_master(game.sfx_volume);
             save_write(&game);
         } else if (game.menu_cursor == 5) {
+            int p = (int)game.audio_port + dir;
+            p = (p + AUDIO_PORT_COUNT) % AUDIO_PORT_COUNT;
+            audio_restart_with_port((u8)p);
+            save_write(&game);
+        } else if (game.menu_cursor == 6) {
             int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
             game.screen_mode = (enum screen_mode)m;
             save_write(&game);
@@ -678,22 +741,28 @@ static void menu_update(u32 pressed) {
             audio_set_master(game.sfx_volume);
             save_write(&game);
             break;
-        case 5:
+        case 5: {
+            u8 p = (u8)((game.audio_port + 1) % AUDIO_PORT_COUNT);
+            audio_restart_with_port(p);
+            save_write(&game);
+            break;
+        }
+        case 6:
             game.screen_mode = (enum screen_mode)
                 ((game.screen_mode + 1) % SCREEN_MODE_COUNT);
             save_write(&game);
             break;
-        case 6:
+        case 7:
             game.high_score = 0;
             game.last_score = 0;
             save_write(&game);
             break;
-        case 7:
-            break;
         case 8:
-            game.show_credits = 1;
             break;
         case 9:
+            game.show_credits = 1;
+            break;
+        case 10:
             save_write(&game);
             g_exit_now = 1;
             break;
@@ -787,6 +856,10 @@ static void *audio_thread_entry(void *arg) {
     void *usleep = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelUsleep");
 
     while (g_audio_running) {
+        if (g_audio_pause) {
+            if (usleep) NC(G, usleep, 15000, 0,0,0,0,0);
+            continue;
+        }
         if (!audio_is_active()) {
             if (usleep) NC(G, usleep, 30000, 0,0,0,0,0);
             continue;
@@ -850,9 +923,13 @@ __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_exit_now      = 0;
     g_audio_running = 1;
+    g_audio_pause   = 0;
     g_audio_tid     = 0;
     g_aud_handle    = -1;
     g_aud_close_fn  = 0;
+    g_aud_open_fn   = 0;
+    g_aud_out_fn    = 0;
+    g_aud_mod       = 0;
     g_pad_fails     = 0;
     pad_prev        = 0;
     haptic_until_ms = 0;
@@ -899,27 +976,29 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "PAD\n", 4);
     pad_init_from();
 
+    save_init();
+    game_init(&game);
+    game.vibration_on = 1;
+    game.sfx_volume   = 100;
+    game.audio_port   = 0;
+    save_load(&game);
+    audio_set_master(game.sfx_volume);
+
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "AUDIO\n", 6);
     audio_init_from();
 
     get_proc_time = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetProcessTime");
     if (get_proc_time) start_us = NC(G, get_proc_time, 0,0,0,0,0,0);
 
-    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "SAVE\n", 5);
-    save_init();
-    game_init(&game);
-    game.vibration_on = 1;
-    game.sfx_volume   = 100;
-    save_load(&game);
-    audio_set_master(game.sfx_volume);
-
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
-    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u\n",
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s sfx=%u port=%s\n",
            nreloc, video_h, pad_h,
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
            save_available(), (int)g_user_id,
-           game_screen_name(game.screen_mode), (unsigned)game.sfx_volume);
+           game_screen_name(game.screen_mode),
+           (unsigned)game.sfx_volume,
+           game_audio_port_name(game.audio_port));
 
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
