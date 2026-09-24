@@ -18,6 +18,13 @@ enum gstate {
     GS_GAMEOVER,
 };
 
+enum screen_mode {
+    SCREEN_FULL = 0,
+    SCREEN_16_9,
+    SCREEN_4_3,
+    SCREEN_MODE_COUNT
+};
+
 struct pipe_pair {
     float x;
     float y_top, y_bot;
@@ -27,8 +34,9 @@ struct pipe_pair {
 #define POOL_PAIRS 6
 
 struct game {
-    enum gstate state;
-    enum diff   diff;
+    enum gstate      state;
+    enum diff        diff;
+    enum screen_mode screen_mode;
 
     /* physics */
     float bird_y, bird_vy;
@@ -66,24 +74,24 @@ struct game {
 
 #define BG_W_ORIG   288
 #define BG_H_ORIG   512
-#define BG_W  ((BG_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 608 */
-#define BG_H  ((BG_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 1080 */
+#define BG_W  ((BG_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
+#define BG_H  ((BG_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
 
 #define BASE_W_ORIG 336
 #define BASE_H_ORIG 112
-#define BASE_W ((BASE_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 709 */
-#define BASE_H ((BASE_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 236 */
+#define BASE_W ((BASE_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
+#define BASE_H ((BASE_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
 #define GROUND_H BASE_H
 
 #define PIPE_W_ORIG 52
 #define PIPE_H_ORIG 320
-#define PIPE_W ((PIPE_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 110 */
-#define PIPE_H ((PIPE_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 675 */
+#define PIPE_W ((PIPE_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
+#define PIPE_H ((PIPE_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
 
 #define BIRD_W_ORIG 34
 #define BIRD_H_ORIG 24
-#define BIRD_W ((BIRD_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 72 */
-#define BIRD_H ((BIRD_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)  /* 51 */
+#define BIRD_W ((BIRD_W_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
+#define BIRD_H ((BIRD_H_ORIG * GAME_SCALE_NUM + GAME_SCALE_DEN/2) / GAME_SCALE_DEN)
 
 #define GAMEOVER_W ((192 * 3 + 1) / 2)   /* 288 */
 #define GAMEOVER_H ((42  * 3 + 1) / 2)   /*  63 */
@@ -100,5 +108,7 @@ void   game_set_diff(struct game *g, enum diff d);
 float  game_diff_pipe_speed(enum diff d);
 float  game_diff_pipe_gap(enum diff d);
 const char *game_diff_name(enum diff d);
+
+const char *game_screen_name(enum screen_mode m);
 
 #endif
