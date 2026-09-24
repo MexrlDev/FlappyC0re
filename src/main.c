@@ -24,11 +24,14 @@ PERSIST static void *G, *D;
 PERSIST static s32 g_user_id = 1;
 PERSIST static volatile int g_exit_now = 0;
 
-/* ---- audio thread control (so we can stop it on exit) ---- */
+/* Audio thread control */
 PERSIST static volatile int g_audio_running = 0;
 PERSIST static u64 g_audio_tid = 0;
 PERSIST static s32 g_aud_handle = -1;
 PERSIST static void *g_aud_close_fn = 0;
+
+/* Pad-read failure tracker — detects controller disconnect */
+PERSIST static u32 g_pad_fails = 0;
 
 /* ---------------- early diagnostic ---------------- */
 
@@ -157,12 +160,13 @@ static void sleep_ms(u32 ms) {
 #define DS_OPTIONS  0x00000008u
 
 static u32 read_pad(void) {
-    if (pad_h < 0 || !pad_read_fn) return 0;
+    if (pad_h < 0 || !pad_read_fn) { g_pad_fails++; return 0; }
     for (int i = 0; i < 128; i++) pad_buf[i] = 0;
     s32 r = (s32)NC(G, pad_read_fn, (u64)pad_h, (u64)pad_buf, 1, 0, 0, 0);
-    if (r <= 0) return 0;
+    if (r <= 0) { g_pad_fails++; return 0; }
     u32 raw = *(u32*)pad_buf;
-    if (raw & 0x80000000u) return 0;
+    if (raw & 0x80000000u) { g_pad_fails++; return 0; }
+    g_pad_fails = 0;
     return raw & 0x001FFFFFu;
 }
 
@@ -175,10 +179,10 @@ static void lightbar(u8 r, u8 g, u8 b) {
     NC(G, pad_lb_fn, (u64)pad_h, (u64)&col, 0,0,0,0);
 }
 
-static const u32 LB_MENU    = 0xFFDC00u;
-static const u32 LB_PLAYING = 0xFFDC00u;
-static const u32 LB_DEAD    = 0xFF0000u;
-static const u32 LB_DEFAULT = 0x0000C8u;
+static const u32 LB_MENU    = 0xFF8000u;   /* orange       */
+static const u32 LB_PLAYING = 0xFFFF00u;   /* bright yellow */
+static const u32 LB_DEAD    = 0xFF0000u;   /* red          */
+static const u32 LB_DEFAULT = 0x0000C8u;   /* Sony soft blue */
 
 static void lightbar_apply(u32 rgb) {
     lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
@@ -227,6 +231,22 @@ static void haptic_apply_toggle(void) {
 }
 
 /* ---------------- present / video init ---------------- */
+
+static void apply_screen_viewport(void) {
+    switch (game.screen_mode) {
+    case SCREEN_FULL:
+        render_set_viewport(1.0f, 0, 0);
+        break;
+    case SCREEN_16_9:
+        /* 1600x900 content centred in 1920x1080 */
+        render_set_viewport(0.833333f, 160, 90);
+        break;
+    case SCREEN_4_3:
+        /* 1440x810 content centred (pillarboxed) */
+        render_set_viewport(0.75f, 240, 135);
+        break;
+    }
+}
 
 static void present(void) {
     NC(G, vid_flip, (u64)video_h, (u64)(total_frames & 1), 1,
@@ -296,6 +316,11 @@ static int video_init(u64 eboot) {
     if (vid_rate) NC(G, vid_rate, (u64)video_h, 0, 0,0,0,0);
 
     render_init((u32*)rbs[0], (u32*)rbs[1]);
+    /* Clear both framebuffers to black so the pillarbox bars start clean. */
+    render_clear_full(0xFF000000);
+    render_swap();
+    render_clear_full(0xFF000000);
+    render_swap();
     return 0;
 }
 
@@ -388,11 +413,12 @@ static void pad_init_from(void) {
     if (pad_h >= 0 && pad_vib_fn)
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
 
+    /* Orange lightbar for the menu. */
     for (int i = 0; i < 5; i++) {
         lightbar_apply(LB_MENU);
         sleep_ms(30);
     }
-    printf("lightbar set to yellow (pad_h=%d lb=%p)\n",
+    printf("lightbar set to orange (pad_h=%d lb=%p)\n",
            pad_h, (void*)pad_lb_fn);
 }
 
@@ -403,12 +429,13 @@ static const char *menu_items[] = {
     "DIFFICULTY",
     "BACKGROUND",
     "VIBRATION",
+    "SCREEN",
     "RESET SCORE",
     "SAVE STATUS",
     "CREDITS",
     "EXIT",
 };
-#define MENU_COUNT 8
+#define MENU_COUNT 9
 
 static void draw_credits(void) {
     render_clear(0xFF0A0A0A);
@@ -436,7 +463,7 @@ static void draw_menu(void) {
     render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
     render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
 
-    int base_y = 380;
+    int base_y = 340;
     for (int i = 0; i < MENU_COUNT; i++) {
         char line[64];
         u32 col = (i == game.menu_cursor) ? 0xFFFFC030u : 0xFFD0D0D0u;
@@ -451,9 +478,12 @@ static void draw_menu(void) {
             snprintf(line, sizeof(line), "VIBRATION: %s", game.vibration_on ? "ON" : "OFF");
             text = line;
         } else if (i == 4) {
-            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            snprintf(line, sizeof(line), "SCREEN: %s", game_screen_name(game.screen_mode));
             text = line;
         } else if (i == 5) {
+            snprintf(line, sizeof(line), "RESET SCORE (%d)", game.high_score);
+            text = line;
+        } else if (i == 6) {
             snprintf(line, sizeof(line), "SAVE: %s",
                      save_available() ? "OK" : "NO SAVEDATA");
             text = line;
@@ -473,11 +503,10 @@ static void draw_menu(void) {
     render_text(40, 990, hi, 0xFF404040u, 3);
 }
 
-/* ---- draw_playing ---- */
 static void draw_playing(void) {
     int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
 
-    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 1;
+    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 2;
     for (int i = 0; i < bg_copies; i++) {
         render_blit_scaled_bg_fp(bg, game.bg_scroll + (float)(i * BG_W),
                                  GAME_SCALE_FP);
@@ -491,7 +520,7 @@ static void draw_playing(void) {
                               GAME_SCALE_FP, 255);
     }
 
-    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 1;
+    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 2;
     for (int i = 0; i < base_copies; i++) {
         render_blit_scaled_fp(A_BASE,
                               game.base_scroll + (float)(i * BASE_W),
@@ -512,7 +541,6 @@ static void draw_playing(void) {
     render_text(40, 100, s, 0xFFFFC030u, 4);
 }
 
-/* ---- draw_gameover ---- */
 static void draw_gameover(void) {
     int gx = (SCR_W - GAMEOVER_W) / 2;
     render_blit_scaled_fp(A_GAMEOVER, (float)gx, (float)(SCR_H / 2 - 100),
@@ -526,7 +554,6 @@ static void draw_gameover(void) {
     render_text_center(900, "X RESTART   O BACK", 0xFFC0C0C0u, 4);
 }
 
-/* ---- draw_ready ---- */
 static void draw_ready(void) {
     draw_playing();
     render_text_center(280, "GET READY",   0xFFFFC030u, 10);
@@ -561,6 +588,10 @@ static void menu_update(u32 pressed) {
             game.vibration_on ^= 1;
             haptic_apply_toggle();
             save_write(&game);
+        } else if (game.menu_cursor == 4) {
+            int m = (game.screen_mode + SCREEN_MODE_COUNT + dir) % SCREEN_MODE_COUNT;
+            game.screen_mode = (enum screen_mode)m;
+            save_write(&game);
         }
     }
 
@@ -581,16 +612,21 @@ static void menu_update(u32 pressed) {
             save_write(&game);
             break;
         case 4:
+            game.screen_mode = (enum screen_mode)
+                ((game.screen_mode + 1) % SCREEN_MODE_COUNT);
+            save_write(&game);
+            break;
+        case 5:
             game.high_score = 0;
             game.last_score = 0;
             save_write(&game);
             break;
-        case 5:
-            break;
         case 6:
-            game.show_credits = 1;
             break;
         case 7:
+            game.show_credits = 1;
+            break;
+        case 8:
             save_write(&game);
             g_exit_now = 1;
             break;
@@ -606,10 +642,12 @@ static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state != last_gstate) {
         printf("STATE %d -> %d (f=%u)\n",
                (int)last_gstate, (int)game.state, (unsigned)total_frames);
-        if (game.state == GS_GAMEOVER) {
+        if (game.state == GS_MENU) {
+            lightbar_apply(LB_MENU);
+        } else if (game.state == GS_GAMEOVER) {
             haptic_death();
             lightbar_apply(LB_DEAD);
-        } else if (game.state == GS_MENU) {
+        } else if (game.state == GS_PAUSED) {
             lightbar_apply(LB_MENU);
         } else {
             lightbar_apply(LB_PLAYING);
@@ -617,10 +655,20 @@ static void game_update_and_draw(u32 pressed, float dt) {
         last_gstate = game.state;
     }
 
+    /* Auto-pause if the controller disconnects mid-game (e.g. turns off). */
+    if (game.state == GS_PLAYING && g_pad_fails > 45) {
+        game.state = GS_PAUSED;
+        printf("PAD disconnected -> auto-pause\n");
+        return;
+    }
+
     if (game.state == GS_READY) {
         game_update(&game, dt);
         if (pressed & DS_CROSS) { game_jump(&game); haptic_low_pulse(); }
-        if (pressed & DS_CIRCLE) game.state = GS_MENU;
+        if (pressed & DS_CIRCLE) {
+            save_write(&game);
+            game.state = GS_MENU;
+        }
         draw_ready();
         return;
     }
@@ -628,7 +676,7 @@ static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state == GS_PLAYING) {
         game_update(&game, dt);
         if (pressed & DS_CROSS)   { game_jump(&game); haptic_low_pulse(); }
-        if (pressed & DS_OPTIONS) game.state = GS_PAUSED;
+        if (pressed & DS_OPTIONS) { game.state = GS_PAUSED; return; }
         draw_playing();
         return;
     }
@@ -639,7 +687,10 @@ static void game_update_and_draw(u32 pressed, float dt) {
         render_text_center(480, "PAUSED", 0xFFFFFFFFu, 10);
         render_text_center(620, "X RESUME   O BACK", 0xFFC0C0C0u, 4);
         if (pressed & DS_CROSS)  game.state = GS_PLAYING;
-        if (pressed & DS_CIRCLE) game.state = GS_MENU;
+        if (pressed & DS_CIRCLE) {
+            save_write(&game);
+            game.state = GS_MENU;
+        }
         return;
     }
 
@@ -667,7 +718,6 @@ static void audio_pump(void) { audio_mix_tick(); }
 static void *audio_thread_entry(void *arg) {
     (void)arg;
 
-    /* Ask for a higher priority so the renderer can't starve us. */
     void *self_fn = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSelf");
     void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
     if (self_fn && setprio) {
@@ -675,7 +725,6 @@ static void *audio_thread_entry(void *arg) {
         if (self) NC(G, setprio, self, 200, 0, 0, 0, 0);
     }
 
-    /* Run until told to stop. */
     while (g_audio_running) audio_pump();
     return 0;
 }
@@ -683,13 +732,9 @@ static void *audio_thread_entry(void *arg) {
 /* ---------------- cleanup ---------------- */
 
 static void cleanup_and_return(struct ext_args_lua *ext) {
-    /* 1. Stop the audio thread FIRST — otherwise it keeps calling
-       sceAudioOutOutput on a device we're about to close, and the
-       next session starts with a wedged audio pipeline. */
     g_audio_running = 0;
     sleep_ms(100);
 
-    /* Hard-cancel in case it's blocked inside sceAudioOutOutput. */
     void *cancel = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
     if (cancel && g_audio_tid) {
         NC(G, cancel, g_audio_tid, 0, 0, 0, 0, 0);
@@ -697,27 +742,21 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
     }
     g_audio_tid = 0;
 
-    /* 2. Kill vibration */
     if (pad_h >= 0 && pad_vib_fn) {
         vib_data[0] = 0; vib_data[1] = 0;
         for (int i = 2; i < 8; i++) vib_data[i] = 0;
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
     }
 
-    /* 3. Restore Sony soft-blue lightbar */
     lightbar_apply(LB_DEFAULT);
     sleep_ms(80);
 
-    /* 4. Shut down audio, THEN close the device handle.  Without the
-       close, session 2's sceAudioOutOpen fails or hands back a bad
-       handle, and the second exit never completes. */
     audio_shutdown();
     if (g_aud_close_fn && g_aud_handle >= 0) {
         NC(G, g_aud_close_fn, (u64)g_aud_handle, 0,0,0,0,0);
         g_aud_handle = -1;
     }
 
-    /* 5. Blank the screen */
     if (fbs_mem) {
         u32 *fb0 = (u32*)fbs_mem;
         u32 *fb1 = (u32*)(fbs_mem + FB_ALIGNED);
@@ -727,19 +766,16 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
         sleep_ms(50);
     }
 
-    /* 6. Close video */
     if (vid_close && video_h >= 0) {
         NC(G, vid_close, (u64)video_h, 0,0,0,0,0);
         video_h = -1;
     }
 
-    /* 7. Delete event queue */
     if (delete_eq && eq) {
         NC(G, delete_eq, eq, 0,0,0,0,0);
         eq = 0;
     }
 
-    /* 8. Mark session as cleanly finished */
     ext->status = 0;
     ext->step   = 99;
     ext->frame  = (u32)total_frames;
@@ -749,14 +785,12 @@ static void cleanup_and_return(struct ext_args_lua *ext) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
-    /* ---- Reset session-scoped globals FIRST.  The shellcode may be
-       loaded at the same mmap address as a previous run, so PERSIST
-       values from the previous session can leak in. ---- */
     g_exit_now      = 0;
     g_audio_running = 1;
     g_audio_tid     = 0;
     g_aud_handle    = -1;
     g_aud_close_fn  = 0;
+    g_pad_fails     = 0;
     pad_prev        = 0;
     haptic_until_ms = 0;
     total_frames    = 0;
@@ -815,10 +849,11 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
-    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d\n",
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d mode=%s\n",
            nreloc, video_h, pad_h,
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
-           save_available(), (int)g_user_id);
+           save_available(), (int)g_user_id,
+           game_screen_name(game.screen_mode));
 
     printf("Layout: BG=%dx%d BASE=%dx%d PIPE=%dx%d BIRD=%dx%d GND_H=%d SCALE_FP=%d\n",
            BG_W, BG_H, BASE_W, BASE_H, PIPE_W, PIPE_H,
@@ -870,6 +905,10 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         u32 pressed = raw & ~pad_prev;
         pad_prev = raw;
+
+        /* Reset the whole framebuffer to black so pillarbox bars stay clean */
+        render_clear_full(0xFF000000);
+        apply_screen_viewport();
 
         if (game.state == GS_MENU) {
             menu_update(pressed);
