@@ -21,6 +21,7 @@ struct ext_args_lua {
 };
 
 PERSIST static void *G, *D;
+PERSIST static u64 g_user_id = 0;
 
 /* ---------------- early diagnostic ---------------- */
 
@@ -249,6 +250,10 @@ static void present(void) {
     } else {
         sleep_ms(16);
     }
+    /* Toggle the draw target so the next frame paints the buffer we are
+       NOT currently showing.  Without this, half of all frames display an
+       uninitialised buffer and the screen flickers. */
+    render_swap();
     total_frames++;
 }
 
@@ -329,14 +334,29 @@ static void pad_init_from(void) {
     s32 pmod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
                        (u64)"libScePad.sprx", 0,0,0,0,0);
     if (pmod < 0) return;
+
     void *p_init = SYM(G, D, pmod, "scePadInit");
     void *p_geth = SYM(G, D, pmod, "scePadGetHandle");
     pad_read_fn  = SYM(G, D, pmod, "scePadRead");
     pad_vib_fn   = SYM(G, D, pmod, "scePadSetVibration");
     pad_lb_fn    = SYM(G, D, pmod, "scePadSetLightBar");
 
+    printf("pad syms: init=%p geth=%p read=%p vib=%p lb=%p uid=%d\n",
+           (void*)p_init, (void*)p_geth, (void*)pad_read_fn,
+           (void*)pad_vib_fn, (void*)pad_lb_fn, (int)g_user_id);
+
     if (p_init) NC(G, p_init, 0,0,0,0,0,0);
-    if (p_geth) pad_h = (s32)NC(G, p_geth, 1, 0, 0, 0, 0, 0);
+
+    /* Try the real user id first, then 0xFF ("any user"), then 1. */
+    if (p_geth) {
+        pad_h = (s32)NC(G, p_geth, g_user_id, 0, 0, 0, 0, 0);
+        if (pad_h < 0)
+            pad_h = (s32)NC(G, p_geth, 0xFF, 0, 0, 0, 0, 0);
+        if (pad_h < 0)
+            pad_h = (s32)NC(G, p_geth, 1, 0, 0, 0, 0, 0);
+    }
+
+    printf("pad handle = %d\n", pad_h);
 
     for (int i = 0; i < 8; i++) vib_data[i] = 0;
     if (pad_h >= 0 && pad_vib_fn)
@@ -412,8 +432,8 @@ static void draw_menu(void) {
     }
 
     render_text(40, 940, "X: SELECT   O: BACK", 0xFF808080u, 3);
-    render_text(SCR_W - 40 - render_text_width("EGYDEVTEAM", 3),
-                940, "EGYDEVTEAM", 0xFF606060u, 3);
+    render_text(SCR_W - 40 - render_text_width("MexrlDev", 3),
+                940, "MexrlDev", 0xFF606060u, 3);
 
     char hi[64];
     snprintf(hi, sizeof(hi), "HIGH: %d   LIFETIME: %u",
@@ -606,15 +626,18 @@ static void *audio_thread_entry(void *arg) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
-    /* Relocations FIRST — every global pointer below depends on them. */
     int nreloc = apply_relocations();
+
+    g_user_id = ext->user_id ? ext->user_id : 0xFF;
+
+    G = (void*)(eboot + GADGET_OFFSET);
+    D = dlsym;
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "ENTRY\n", 6);
     early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
                       "RELOC ", (u64)nreloc);
-
-    G = (void*)(eboot + GADGET_OFFSET);
-    D = dlsym;
+    early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
+                      "UID ", g_user_id);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "VIDEO\n", 6);
 
@@ -638,17 +661,15 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         ext->log_fd, ext->log_sa);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "PAD\n", 4);
-
     pad_init_from();
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "AUDIO\n", 6);
-
     audio_init_from();
+
     get_proc_time = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetProcessTime");
     if (get_proc_time) start_us = NC(G, get_proc_time, 0,0,0,0,0,0);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "SAVE\n", 5);
-
     save_init();
     game_init(&game);
     game.vibration_on = 1;
@@ -656,10 +677,10 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
-    printf("FlappyBird: relocs=%d video_h=%d pad=%d vib=%d lb=%d save=%d vib_on=%d\n",
+    printf("FlappyBird: relocs=%d video_h=%d pad_h=%d vib=%d lb=%d save=%d uid=%d\n",
            nreloc, video_h, pad_h,
            pad_vib_fn ? 1 : 0, pad_lb_fn ? 1 : 0,
-           save_available(), game.vibration_on);
+           save_available(), (int)g_user_id);
 
     void *pc = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
     if (pc) {
@@ -681,6 +702,13 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         if (dt <= 0.0f) dt = 1.0f / 60.0f;
 
         haptic_tick();
+
+        /* Debug: log pad state every 60 frames for the first 10 seconds. */
+        if (total_frames < 600 && (total_frames % 60) == 0) {
+            u32 raw = read_pad();
+            printf("PAD f=%u raw=%08x prev=%08x\n",
+                   (unsigned)total_frames, raw, pad_prev);
+        }
 
         u32 pressed = pad_pressed();
 
