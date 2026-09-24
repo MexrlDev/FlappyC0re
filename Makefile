@@ -27,15 +27,12 @@ ASSET_SCRIPT  := tools/bake_assets.py
 
 all: $(TARGET_BIN) $(TARGET_ELF) $(TARGET_HEX)
 
-# Fail with a clear message if the bake script is missing from the tree.
 ifeq ($(wildcard $(ASSET_SCRIPT)),)
-$(error $(ASSET_SCRIPT) not found.  Did you commit it?  \
-        Check with: git ls-files tools/)
+$(error $(ASSET_SCRIPT) not found.  Check with: git ls-files tools/)
 endif
 
-# Stamp-file approach: the bake script runs once, produces all three
-# generated files, and we touch a stamp so make knows it's up to date.
-# Portable to make < 4.3 (grouped targets `&:` need 4.3+).
+# Stamp-file approach: bake script runs once, produces all three files,
+# and we touch a stamp so make knows the outputs are current.
 src/.assets.stamp: $(ASSET_SCRIPT) \
                    $(wildcard assets/*.png) $(wildcard assets/*.wav)
 	@mkdir -p src
@@ -64,9 +61,12 @@ $(TARGET_BIN): $(TARGET_ELF)
 	@printf "  elf: %8d bytes\n" $$(stat -c%s $(TARGET_ELF) 2>/dev/null || stat -f%z $(TARGET_ELF))
 	@printf "  bin: %8d bytes\n" $$(stat -c%s $(TARGET_BIN) 2>/dev/null || stat -f%z $(TARGET_BIN))
 
-hex: $(TARGET_BIN)
-	@xxd -p $(TARGET_BIN) | tr -d '\n' > $(TARGET_HEX)
+# Real file rule for flappy.hex.  hex: is a thin phony wrapper for convenience.
+$(TARGET_HEX): $(TARGET_BIN)
+	@xxd -p $(TARGET_BIN) | tr -d '\n' > $@
 	@printf "  hex: %8d bytes\n" $$(stat -c%s $(TARGET_HEX) 2>/dev/null || stat -f%z $(TARGET_HEX))
+
+hex: $(TARGET_HEX)
 
 clean:
 	rm -rf build
