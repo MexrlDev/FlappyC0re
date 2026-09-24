@@ -5,7 +5,7 @@ extern const u8 asset_blob[];
 
 #define NUM_VOICES 32
 #define GRAIN      2048
-#define FADE_LEN   256        /* ~5.3 ms at 48 kHz */
+#define FADE_LEN   256
 
 struct voice {
     const s16 *pcm;
@@ -21,14 +21,19 @@ PERSIST static void *audio_out_fn;
 PERSIST static void *gadget;
 PERSIST static s16 mix_buf[GRAIN * 2];
 
+PERSIST static u8 audio_master = 100;
+
+void audio_set_master(u8 v) {
+    if (v > 100) v = 100;
+    audio_master = v;
+}
+
 int audio_init(s32 h, void *fn, void *G) {
     audio_handle = h;
     audio_out_fn = fn;
     gadget = G;
     for (int i = 0; i < NUM_VOICES; i++) voices[i].active = 0;
 
-    /* Prime the device with several silent buffers so the first real
-       sound request doesn't stall while the hardware spins up. */
     if (h >= 0 && fn) {
         static s16 silence[GRAIN * 2];
         for (int i = 0; i < GRAIN * 2; i++) silence[i] = 0;
@@ -45,6 +50,7 @@ void audio_shutdown(void) {
 
 void audio_play(enum asset_id id, float vol) {
     if (audio_handle < 0 || !audio_out_fn) return;
+    if (audio_master == 0) return;
     if (id < 0 || id >= ASSET_COUNT) return;
     const struct asset *a = &asset_table[id];
     if (a->fmt != ASSET_FMT_S16_MONO_48K) return;
@@ -68,6 +74,17 @@ void audio_play(enum asset_id id, float vol) {
     voices[slot].active = 1;
 }
 
+/* Soft-clip: linear below +/-20000, compressed above, ceiling at +/-31000.
+   Prevents the hard distortion that happened when the flap and pipe
+   sounds summed above the s16 range. */
+static inline int soft_clip(int s) {
+    if (s >  31000) return  31000;
+    if (s < -31000) return -31000;
+    if (s >  20000) return  20000 + (s -  20000) / 3;
+    if (s < -20000) return -20000 + (s +  20000) / 3;
+    return s;
+}
+
 void audio_mix_tick(void) {
     if (audio_handle < 0 || !audio_out_fn) return;
 
@@ -82,26 +99,23 @@ void audio_mix_tick(void) {
 
             s32 sample = voices[v].pcm[voices[v].pos];
 
-            /* Fade-in / fade-out envelope to eliminate clicks at the
-               start and end of every voice.  This is the "cutting"
-               artifact — hard starts and hard stops of the source WAV. */
             float gain = voices[v].vol;
             u32 pos = voices[v].pos;
             u32 len = voices[v].len;
 
-            if (pos < FADE_LEN) {
+            if (pos < FADE_LEN)
                 gain *= (float)pos / (float)FADE_LEN;
-            }
             u32 rem = len - pos;
-            if (rem < FADE_LEN) {
+            if (rem < FADE_LEN)
                 gain *= (float)rem / (float)FADE_LEN;
-            }
 
             voices[v].pos++;
             acc += (int)(sample * gain);
         }
-        if (acc > 32767)  acc = 32767;
-        if (acc < -32768) acc = -32768;
+
+        acc = (acc * audio_master) / 100;
+        acc = soft_clip(acc);
+
         mix_buf[i*2]   = (s16)acc;
         mix_buf[i*2+1] = (s16)acc;
     }
