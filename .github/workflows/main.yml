@@ -18,7 +18,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential git binutils file \
-            python3 python3-pil curl
+            python3 python3-pil curl \
+            fonts-dejavu-core
 
       - name: Verify toolchain
         run: |
@@ -27,6 +28,7 @@ jobs:
           make    --version | head -n1
           python3 --version
           python3 -c "import PIL; print('Pillow', PIL.__version__)"
+          ls -l /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
 
       - name: Fetch Flappy Bird assets
         run: |
@@ -37,11 +39,23 @@ jobs:
           echo "---- Credits.txt ----"
           cat assets/Credits.txt || true
 
+      - name: Bake anti-aliased font
+        run: |
+          # Font atlas is baked fresh every CI run so it never depends
+          # on a committed .bin.  tools/bake_font.py writes:
+          #   src/font_aa.bin         (glyph alpha bitmaps)
+          #   src/font_aa_metrics.h   (per-glyph bbox + advance table)
+          python3 tools/bake_font.py
+          echo "---- baked files ----"
+          ls -lh src/font_aa.bin src/font_aa_metrics.h
+
       - name: Clean before build
         run: |
           rm -rf build
           rm -f flappy.elf flappy.bin flappy.hex
           rm -f src/assets.h src/assets.bin src/assets.S src/.assets.stamp
+          # NOTE: do NOT delete src/font_aa.bin or src/font_aa_metrics.h
+          # here — they were just produced by the previous step.
 
       - name: Build
         run: |
@@ -75,4 +89,15 @@ jobs:
             flappy.bin
             flappy.hex
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload baked font (optional)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FlappyC0re-font
+          path: |
+            src/font_aa.bin
+            src/font_aa_metrics.h
+          if-no-files-found: warn
           retention-days: 30
