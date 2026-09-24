@@ -24,13 +24,11 @@ PERSIST static void *G, *D;
 PERSIST static s32 g_user_id = 1;
 PERSIST static volatile int g_exit_now = 0;
 
-/* Audio thread control */
 PERSIST static volatile int g_audio_running = 0;
 PERSIST static u64 g_audio_tid = 0;
 PERSIST static s32 g_aud_handle = -1;
 PERSIST static void *g_aud_close_fn = 0;
 
-/* Pad-read failure tracker — detects controller disconnect */
 PERSIST static u32 g_pad_fails = 0;
 
 /* ---------------- early diagnostic ---------------- */
@@ -188,6 +186,41 @@ static void lightbar_apply(u32 rgb) {
     lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
 }
 
+/* Rainbow colour: hue walk over a 6-segment cycle.
+   Call with a rising tick counter; returns R<<16 | G<<8 | B. */
+static u32 rainbow_color(u32 tick) {
+    u32 t = tick & 0x5FF;              /* 0..1535 */
+    u32 r, g, b;
+    if      (t < 256)  { r = 255;       g = t;          b = 0; }
+    else if (t < 512)  { r = 511 - t;   g = 255;        b = 0; }
+    else if (t < 768)  { r = 0;         g = 255;        b = t - 512; }
+    else if (t < 1024) { r = 0;         g = 1023 - t;   b = 255; }
+    else if (t < 1280) { r = t - 1024;  g = 0;          b = 255; }
+    else               { r = 255;       g = 0;          b = 1535 - t; }
+    return (r << 16) | (g << 8) | b;
+}
+
+/* Only writes to the lightbar when the colour actually changes.
+   Called every frame from the main loop. */
+static u32 g_last_lb = 0xFFFFFFFFu;
+static void update_lightbar(void) {
+    u32 desired;
+    if (game.state == GS_PAUSED) {
+        /* Fast rainbow while paused.  16 units per frame × 30 fps ≈ 480
+           units/s → a full cycle in ~3.2 s. */
+        desired = rainbow_color(total_frames * 16u);
+    } else if (game.state == GS_GAMEOVER) {
+        desired = LB_DEAD;
+    } else if (game.state == GS_PLAYING || game.state == GS_READY) {
+        desired = LB_PLAYING;
+    } else {
+        desired = LB_MENU;
+    }
+    if (desired == g_last_lb) return;
+    g_last_lb = desired;
+    lightbar_apply(desired);
+}
+
 /* ---------------- haptics ---------------- */
 
 static void haptic_raw(u8 large, u8 small) {
@@ -238,11 +271,9 @@ static void apply_screen_viewport(void) {
         render_set_viewport(1.0f, 0, 0);
         break;
     case SCREEN_16_9:
-        /* 1600x900 content centred in 1920x1080 */
         render_set_viewport(0.833333f, 160, 90);
         break;
     case SCREEN_4_3:
-        /* 1440x810 content centred (pillarboxed) */
         render_set_viewport(0.75f, 240, 135);
         break;
     }
@@ -316,7 +347,6 @@ static int video_init(u64 eboot) {
     if (vid_rate) NC(G, vid_rate, (u64)video_h, 0, 0,0,0,0);
 
     render_init((u32*)rbs[0], (u32*)rbs[1]);
-    /* Clear both framebuffers to black so the pillarbox bars start clean. */
     render_clear_full(0xFF000000);
     render_swap();
     render_clear_full(0xFF000000);
@@ -413,7 +443,6 @@ static void pad_init_from(void) {
     if (pad_h >= 0 && pad_vib_fn)
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
 
-    /* Orange lightbar for the menu. */
     for (int i = 0; i < 5; i++) {
         lightbar_apply(LB_MENU);
         sleep_ms(30);
@@ -451,7 +480,10 @@ static void draw_credits(void) {
     render_text_center(510, "ASSETS", 0xFF808080u, 4);
     render_text_center(560, "Samuel Custodio (MIT)", 0xFFD0D0D0u, 4);
 
-    render_text_center(880, "X or O to return", 0xFFC0C0C0u, 4);
+    /* Tribute line — light blue (sky blue) */
+    render_text_center(730, "In memory of PsVue-Mod", 0xFF87CEEBu, 5);
+
+    render_text_center(900, "X or O to return", 0xFFC0C0C0u, 4);
 }
 
 static void draw_menu(void) {
@@ -506,7 +538,7 @@ static void draw_menu(void) {
 static void draw_playing(void) {
     int bg = game.is_night ? A_BG_NIGHT : A_BG_DAY;
 
-    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 2;
+    int bg_copies = (SCR_W + BG_W - 1) / BG_W + 1;
     for (int i = 0; i < bg_copies; i++) {
         render_blit_scaled_bg_fp(bg, game.bg_scroll + (float)(i * BG_W),
                                  GAME_SCALE_FP);
@@ -520,7 +552,7 @@ static void draw_playing(void) {
                               GAME_SCALE_FP, 255);
     }
 
-    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 2;
+    int base_copies = (SCR_W + BASE_W - 1) / BASE_W + 1;
     for (int i = 0; i < base_copies; i++) {
         render_blit_scaled_fp(A_BASE,
                               game.base_scroll + (float)(i * BASE_W),
@@ -642,20 +674,11 @@ static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state != last_gstate) {
         printf("STATE %d -> %d (f=%u)\n",
                (int)last_gstate, (int)game.state, (unsigned)total_frames);
-        if (game.state == GS_MENU) {
-            lightbar_apply(LB_MENU);
-        } else if (game.state == GS_GAMEOVER) {
-            haptic_death();
-            lightbar_apply(LB_DEAD);
-        } else if (game.state == GS_PAUSED) {
-            lightbar_apply(LB_MENU);
-        } else {
-            lightbar_apply(LB_PLAYING);
-        }
+        if (game.state == GS_GAMEOVER) haptic_death();
         last_gstate = game.state;
     }
 
-    /* Auto-pause if the controller disconnects mid-game (e.g. turns off). */
+    /* Auto-pause on controller disconnect */
     if (game.state == GS_PLAYING && g_pad_fails > 45) {
         game.state = GS_PAUSED;
         printf("PAD disconnected -> auto-pause\n");
@@ -676,7 +699,13 @@ static void game_update_and_draw(u32 pressed, float dt) {
     if (game.state == GS_PLAYING) {
         game_update(&game, dt);
         if (pressed & DS_CROSS)   { game_jump(&game); haptic_low_pulse(); }
-        if (pressed & DS_OPTIONS) { game.state = GS_PAUSED; return; }
+        if (pressed & DS_OPTIONS) {
+            /* Record current score before pausing so save-on-quit keeps it. */
+            if (game.score > game.high_score) game.high_score = game.score;
+            save_write(&game);
+            game.state = GS_PAUSED;
+            return;
+        }
         draw_playing();
         return;
     }
@@ -718,11 +747,14 @@ static void audio_pump(void) { audio_mix_tick(); }
 static void *audio_thread_entry(void *arg) {
     (void)arg;
 
+    /* Push audio thread priority up so it survives a busy render frame.
+       On Sony's kernel the exact range is undocumented; passing a large
+       value is safest — an out-of-range value is simply clamped. */
     void *self_fn = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSelf");
     void *setprio = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadSetprio");
     if (self_fn && setprio) {
         u64 self = NC(G, self_fn, 0,0,0,0,0,0);
-        if (self) NC(G, setprio, self, 200, 0, 0, 0, 0);
+        if (self) NC(G, setprio, self, 700, 0, 0, 0, 0);
     }
 
     while (g_audio_running) audio_pump();
@@ -797,6 +829,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     video_h         = -1;
     fbs_mem         = 0;
     eq              = 0;
+    g_last_lb       = 0xFFFFFFFFu;
     last_gstate     = 0xFF;
 
     int nreloc = apply_relocations();
@@ -906,7 +939,12 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         u32 pressed = raw & ~pad_prev;
         pad_prev = raw;
 
-        /* Reset the whole framebuffer to black so pillarbox bars stay clean */
+        /* Update lightbar (rainbow while paused). */
+        update_lightbar();
+
+        /* Clear the framebuffer to black so pillarbox bars stay clean
+           for letterboxed screen modes.  rep stosl handles 1920*1080
+           in well under a millisecond. */
         render_clear_full(0xFF000000);
         apply_screen_viewport();
 
