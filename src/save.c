@@ -74,6 +74,11 @@ int save_load(struct game *g) {
     else
         g->sfx_volume = 100;
 
+    if (b.version >= 5 && b.audio_port < AUDIO_PORT_COUNT)
+        g->audio_port = (u8)b.audio_port;
+    else
+        g->audio_port = 0;
+
     return 0;
 }
 
@@ -91,6 +96,7 @@ int save_write(const struct game *g) {
     b.vibration_on   = g->vibration_on ? 1 : 0;
     b.screen_mode    = (u32)g->screen_mode;
     b.sfx_volume     = (u32)g->sfx_volume;
+    b.audio_port     = (u32)g->audio_port;
     b.checksum       = checksum(&b.magic, 8);
 
     FILE *f = fopen(active_path, "w");
