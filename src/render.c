@@ -81,19 +81,20 @@ static const struct asset *get_asset(int id) {
     return &asset_table[id];
 }
 
-/* Alpha below this is treated as fully transparent; above is fully opaque. */
-#define ALPHA_CUTOFF 32
-
-/* Source-major scaled blit using Bresenham-style accumulators.
-   For each source pixel (sx, sy) we compute the destination rectangle
-   [dx0, dx1) x [dy0, dy1) that it fills, using only adds and subtracts —
-   no integer divisions in the inner loops. */
+/* Source-major scaled blit.  Alpha of the palette entry is treated as
+   binary: exactly zero → skip, anything else → fully opaque.  This is
+   the fix for the "blank spots" — the previous cutoff of 32 was culling
+   real pixels whose palette alpha happened to be low (the PNG edges
+   quantized to alpha 5-30 in the palette). */
 static void blit_indexed_fp(const u8 *pal, const u8 *idx,
                             int src_w, int src_h,
                             int dst_x, int dst_y,
                             int dst_w, int dst_h,
                             u8 alpha, int force_opaque)
 {
+    (void)alpha;
+    (void)force_opaque;
+
     if (dst_w < 1 || dst_h < 1 || src_w < 1 || src_h < 1) return;
 
     int vpx0 = g_voffx;
@@ -115,14 +116,12 @@ static void blit_indexed_fp(const u8 *pal, const u8 *idx,
     if (dst_y + cy1 > vpy1) cy1 = vpy1 - dst_y;
     if (cx1 <= cx0 || cy1 <= cy0) return;
 
-    /* First/last source row that can contribute. */
     int sy_start = (cy0 * src_h) / dst_h;
     int sy_end   = ((cy1 * src_h) + dst_h - 1) / dst_h;
     if (sy_start < 0) sy_start = 0;
     if (sy_end > src_h) sy_end = src_h;
     if (sy_end <= sy_start) return;
 
-    /* Prime the Y accumulator to sy_start's starting position. */
     u32 y_acc = (u32)sy_start * (u32)dst_h;
     int dy_cur = (int)(y_acc / (u32)src_h);
     y_acc %= (u32)src_h;
@@ -166,16 +165,8 @@ static void blit_indexed_fp(const u8 *pal, const u8 *idx,
             u32 sa = pal[i*4+3];
             if (sa == 0) continue;
 
-            u32 col;
-            if (force_opaque) {
-                col = 0xFF000000u | (pal[i*4+0] << 16)
+            u32 col = 0xFF000000u | (pal[i*4+0] << 16)
                                    | (pal[i*4+1] << 8) | pal[i*4+2];
-            } else {
-                u32 v = (sa * (u32)alpha) >> 8;
-                if (v < ALPHA_CUTOFF) continue;
-                col = 0xFF000000u | (pal[i*4+0] << 16)
-                                   | (pal[i*4+1] << 8) | pal[i*4+2];
-            }
 
             int px0  = dst_x + ccx0;
             int span = ccx1 - ccx0;
