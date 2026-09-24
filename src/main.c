@@ -21,7 +21,7 @@ struct ext_args_lua {
 };
 
 PERSIST static void *G, *D;
-PERSIST static u64 g_user_id = 0;
+PERSIST static s32 g_user_id = 1;   /* default to 1, override after query */
 
 /* ---------------- early diagnostic ---------------- */
 
@@ -231,9 +231,9 @@ static void lightbar(u8 r, u8 g, u8 b) {
     NC(G, pad_lb_fn, (u64)pad_h, (u64)lb_data, 0,0,0,0);
 }
 
-static const u32 LB_MENU    = 0x0000C8u;
-static const u32 LB_PLAYING = 0xFFDC00u;
-static const u32 LB_DEAD    = 0xFF0000u;
+static const u32 LB_MENU    = 0xFFDC00u;   /* yellow — on entry */
+static const u32 LB_PLAYING = 0xFFDC00u;   /* yellow — while playing */
+static const u32 LB_DEAD    = 0xFF0000u;   /* red on game over */
 
 static void lightbar_apply(u32 rgb) {
     lightbar((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
@@ -250,9 +250,8 @@ static void present(void) {
     } else {
         sleep_ms(16);
     }
-    /* Toggle the draw target so the next frame paints the buffer we are
-       NOT currently showing.  Without this, half of all frames display an
-       uninitialised buffer and the screen flickers. */
+    /* Toggle draw target so next frame paints the buffer we are NOT
+       currently showing.  Without this the screen flickers. */
     render_swap();
     total_frames++;
 }
@@ -315,7 +314,37 @@ static int video_init(u64 eboot) {
     return 0;
 }
 
-/* ---------------- audio + pad init ---------------- */
+/* ---------------- user id + audio + pad init ---------------- */
+
+static void query_real_user_id(void) {
+    void *load_mod = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLoadStartModule");
+    if (!load_mod) { printf("query_uid: no load_mod\n"); return; }
+
+    s32 usr_mod = (s32)NC(G, load_mod, (u64)"libSceUserService.sprx",
+                          0,0,0,0,0);
+    if (usr_mod < 0) { printf("query_uid: load usr_mod failed %d\n", usr_mod); return; }
+
+    void *get_init   = SYM(G, D, usr_mod, "sceUserServiceGetInitialUser");
+    void *get_fg     = SYM(G, D, usr_mod, "sceUserServiceGetForegroundUser");
+    void *get_login  = SYM(G, D, usr_mod, "sceUserServiceGetLoginUserIdList");
+
+    printf("query_uid: init=%p fg=%p login=%p\n",
+           (void*)get_init, (void*)get_fg, (void*)get_login);
+
+    s32 uid = 0;
+    if (get_init) {
+        uid = 0;
+        s32 r = (s32)NC(G, get_init, (u64)&uid, 0,0,0,0,0);
+        printf("query_uid: GetInitialUser ret=%d uid=%d\n", r, uid);
+        if (r == 0 && uid > 0) { g_user_id = uid; return; }
+    }
+    if (get_fg) {
+        uid = 0;
+        s32 r = (s32)NC(G, get_fg, (u64)&uid, 0,0,0,0,0);
+        printf("query_uid: GetForegroundUser ret=%d uid=%d\n", r, uid);
+        if (r == 0 && uid > 0) { g_user_id = uid; return; }
+    }
+}
 
 static void audio_init_from(void) {
     s32 amod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
@@ -333,7 +362,7 @@ static void audio_init_from(void) {
 static void pad_init_from(void) {
     s32 pmod = (s32)NC(G, SYM(G,D,LIBKERNEL_HANDLE,"sceKernelLoadStartModule"),
                        (u64)"libScePad.sprx", 0,0,0,0,0);
-    if (pmod < 0) return;
+    if (pmod < 0) { printf("pad_init: load libScePad failed %d\n", pmod); return; }
 
     void *p_init = SYM(G, D, pmod, "scePadInit");
     void *p_geth = SYM(G, D, pmod, "scePadGetHandle");
@@ -341,19 +370,28 @@ static void pad_init_from(void) {
     pad_vib_fn   = SYM(G, D, pmod, "scePadSetVibration");
     pad_lb_fn    = SYM(G, D, pmod, "scePadSetLightBar");
 
-    printf("pad syms: init=%p geth=%p read=%p vib=%p lb=%p uid=%d\n",
+    printf("pad syms: init=%p geth=%p read=%p vib=%p lb=%p\n",
            (void*)p_init, (void*)p_geth, (void*)pad_read_fn,
-           (void*)pad_vib_fn, (void*)pad_lb_fn, (int)g_user_id);
+           (void*)pad_vib_fn, (void*)pad_lb_fn);
 
     if (p_init) NC(G, p_init, 0,0,0,0,0,0);
 
-    /* Try the real user id first, then 0xFF ("any user"), then 1. */
     if (p_geth) {
-        pad_h = (s32)NC(G, p_geth, g_user_id, 0, 0, 0, 0, 0);
-        if (pad_h < 0)
-            pad_h = (s32)NC(G, p_geth, 0xFF, 0, 0, 0, 0, 0);
-        if (pad_h < 0)
-            pad_h = (s32)NC(G, p_geth, 1, 0, 0, 0, 0, 0);
+        /* Try several user ids, in order of likelihood. */
+        s32 candidates[6];
+        int n = 0;
+        candidates[n++] = g_user_id;   /* real user id from C query */
+        candidates[n++] = 1;
+        candidates[n++] = 0;
+        candidates[n++] = 0xFF;
+        candidates[n++] = 0xFE;
+        candidates[n++] = 0x10000000;
+
+        for (int i = 0; i < n && pad_h < 0; i++) {
+            s32 uid = candidates[i];
+            pad_h = (s32)NC(G, p_geth, (u64)uid, 0, 0, 0, 0, 0);
+            printf("pad try uid=%d -> handle=%d\n", uid, pad_h);
+        }
     }
 
     printf("pad handle = %d\n", pad_h);
@@ -361,6 +399,8 @@ static void pad_init_from(void) {
     for (int i = 0; i < 8; i++) vib_data[i] = 0;
     if (pad_h >= 0 && pad_vib_fn)
         NC(G, pad_vib_fn, (u64)pad_h, (u64)vib_data, 0,0,0,0);
+
+    /* Yellow lightbar as soon as we take over. */
     lightbar_apply(LB_MENU);
 }
 
@@ -402,7 +442,7 @@ static void draw_menu(void) {
 
     render_text_center(80,  "FLAPPY BIRD", 0xFF000000u, 10);
     render_text_center(74,  "FLAPPY BIRD", 0xFFFFC030u, 10);
-    render_text_center(240, "PS5 PORT",     0xFF808080u, 4);
+    render_text_center(240, "PS4/PS5 PORT", 0xFF808080u, 4);
 
     int base_y = 380;
     for (int i = 0; i < MENU_COUNT; i++) {
@@ -546,6 +586,7 @@ static void menu_update(u32 pressed) {
         case 7:
             save_write(&game);
             haptic_raw(0, 0);
+            /* Restore the default soft blue before we hand back to LuaC0re. */
             lightbar(0, 0, 200);
             for (;;) sleep_ms(100);
         }
@@ -628,16 +669,12 @@ __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     int nreloc = apply_relocations();
 
-    g_user_id = ext->user_id ? ext->user_id : 0xFF;
-
     G = (void*)(eboot + GADGET_OFFSET);
     D = dlsym;
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "ENTRY\n", 6);
     early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
                       "RELOC ", (u64)nreloc);
-    early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
-                      "UID ", g_user_id);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "VIDEO\n", 6);
 
@@ -659,6 +696,12 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMkdir"),
         SYM(G, D, LIBKERNEL_HANDLE, "sendto"),
         ext->log_fd, ext->log_sa);
+
+    /* Discover the real user id in C — the Lua fallback of 255 will not work. */
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "UID\n", 4);
+    query_real_user_id();
+    early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
+                      "UIDFINAL ", (u64)g_user_id);
 
     early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "PAD\n", 4);
     pad_init_from();
@@ -703,11 +746,11 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
 
         haptic_tick();
 
-        /* Debug: log pad state every 60 frames for the first 10 seconds. */
-        if (total_frames < 600 && (total_frames % 60) == 0) {
+        /* Log pad state every 60 frames for the first 15 seconds. */
+        if (total_frames < 900 && (total_frames % 60) == 0) {
             u32 raw = read_pad();
-            printf("PAD f=%u raw=%08x prev=%08x\n",
-                   (unsigned)total_frames, raw, pad_prev);
+            printf("PAD f=%u raw=%08x prev=%08x state=%d\n",
+                   (unsigned)total_frames, raw, pad_prev, (int)game.state);
         }
 
         u32 pressed = pad_pressed();
