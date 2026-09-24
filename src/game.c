@@ -169,7 +169,11 @@ static void update_pipes(struct game *g, float dt) {
         struct pipe_pair *p = g->active[i];
         p->x -= g->pipe_speed * 60.0f * dt;
 
-        if (!p->passed && p->x + (float)PIPE_W < BIRD_X) {
+        /* Score trigger on ENTRY: the pipe's left edge has reached the
+           bird's right edge.  Previously this fired on exit (pipe right
+           edge past bird left edge), which played the sound after the
+           bird was already out the other side. */
+        if (!p->passed && p->x < BIRD_X + BIRD_W_F) {
             p->passed = 1;
             g->score++;
             g->lifetime_pipes++;
