@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: MIT
+name: Build FlappyC0re
+
+# Manual trigger only — long build, large artifacts.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git binutils file \
+            python3 python3-pil curl
+
+      - name: Verify toolchain
+        run: |
+          gcc     --version | head -n1
+          objcopy --version | head -n1
+          make    --version | head -n1
+          python3 --version
+          python3 -c "import PIL; print('Pillow', PIL.__version__)"
+
+      - name: Fetch Flappy Bird assets
+        run: |
+          chmod +x tools/fetch_assets.sh
+          ./tools/fetch_assets.sh assets
+          echo "---- assets/ ----"
+          ls -la assets/
+          echo "---- Credits.txt ----"
+          cat assets/Credits.txt || true
+
+      - name: Clean before build
+        run: |
+          rm -rf build
+          rm -f flappy.elf flappy.bin flappy.hex
+          rm -f src/assets.h src/assets.bin src/assets.S src/.assets.stamp
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Verify target compatibility
+        run: |
+          # Single flat RWX PT_LOAD, x86_64, entry at _start.
+          # Same binary runs on PS4 and PS5 — the offsets in core.h are
+          # for Star Wars Racer Revenge (CUSA03474 / CUSA03492), which
+          # is the same game on both platforms.
+          readelf -h flappy.elf | grep -E 'Class|Machine|Entry'
+          readelf -l flappy.elf | grep -A1 LOAD
+
+      - name: Inspect artifacts
+        run: |
+          ls -lh flappy.elf flappy.bin flappy.hex
+          echo "---- ELF header ----"      ; readelf -h flappy.elf
+          echo "---- Program headers ----" ; readelf -l flappy.elf
+          echo "---- Section headers ----" ; readelf -S flappy.elf
+          echo "---- Binary size ----"     ; wc -c flappy.bin
+          echo "---- Hex size ----"        ; wc -c flappy.hex
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlappyC0re
+          path: |
+            flappy.elf
+            flappy.bin
+            flappy.hex
+          if-no-files-found: error
+          retention-days: 30
