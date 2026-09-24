@@ -4,8 +4,15 @@
 extern const u8 asset_blob[];
 
 #define NUM_VOICES 32
-#define GRAIN      1024          /* must match the buffer size opened in main.c */
-#define FADE_LEN   256           /* ~5.3 ms at 48 kHz */
+#define GRAIN      1024           /* must match the buffer size opened in main.c */
+
+/* Asymmetric fades.  A short fade-in kills the initial click without
+   affecting the attack, and a very short fade-out leaves the natural
+   decay of the source WAV intact.  The previous symmetric 256-sample
+   fade chopped the tail of every SFX and produced an audible "swish"
+   when the score sound played. */
+#define FADE_IN_LEN   128         /* ~2.7 ms at 48 kHz */
+#define FADE_OUT_LEN   48         /* ~1.0 ms at 48 kHz */
 
 struct voice {
     const s16 *pcm;
@@ -59,6 +66,18 @@ void audio_play(enum asset_id id, float vol) {
     const struct asset *a = &asset_table[id];
     if (a->fmt != ASSET_FMT_S16_MONO_48K) return;
 
+    const s16 *pcm = (const s16*)(asset_blob + a->offset);
+
+    /* One-at-a-time per asset: kill any running instance of the same
+       sound before starting a new one.  Without this, quickly scoring
+       two pipes in a row leaves two overlapping score voices that sum
+       and hit the soft-clipper. */
+    for (int i = 0; i < NUM_VOICES; i++) {
+        if (voices[i].active && voices[i].pcm == pcm) {
+            voices[i].active = 0;
+        }
+    }
+
     int slot = -1;
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!voices[i].active) { slot = i; break; }
@@ -71,21 +90,21 @@ void audio_play(enum asset_id id, float vol) {
     }
     if (slot < 0) return;
 
-    voices[slot].pcm    = (const s16*)(asset_blob + a->offset);
+    voices[slot].pcm    = pcm;
     voices[slot].len    = a->h;
     voices[slot].pos    = 0;
     voices[slot].vol    = vol;
     voices[slot].active = 1;
 }
 
-/* Soft-clip: linear below ±20000, compressed above, ceiling at ±31000.
-   Prevents the hard distortion that happens when two voices sum above
-   the s16 range (e.g. flap + pipe-score at the same instant). */
+/* Gentler soft-clip: linear up to ±26000, then 1/2 slope, ceiling
+   around ±29000.  This is transparent for a single voice and only
+   compresses when two or more sounds overlap. */
 static inline int soft_clip(int s) {
-    if (s >  31000) return  31000;
-    if (s < -31000) return -31000;
-    if (s >  20000) return  20000 + (s -  20000) / 3;
-    if (s < -20000) return -20000 + (s +  20000) / 3;
+    if (s >  32760) return  32760;
+    if (s < -32760) return -32760;
+    if (s >  26000) return  26000 + (s -  26000) / 2;
+    if (s < -26000) return -26000 + (s +  26000) / 2;
     return s;
 }
 
@@ -107,11 +126,11 @@ void audio_mix_tick(void) {
             u32 pos = voices[v].pos;
             u32 len = voices[v].len;
 
-            if (pos < FADE_LEN)
-                gain *= (float)pos / (float)FADE_LEN;
+            if (pos < FADE_IN_LEN)
+                gain *= (float)pos / (float)FADE_IN_LEN;
             u32 rem = len - pos;
-            if (rem < FADE_LEN)
-                gain *= (float)rem / (float)FADE_LEN;
+            if (rem < FADE_OUT_LEN)
+                gain *= (float)rem / (float)FADE_OUT_LEN;
 
             voices[v].pos++;
             acc += (int)(sample * gain);
