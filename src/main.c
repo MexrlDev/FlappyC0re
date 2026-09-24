@@ -22,6 +22,50 @@ struct ext_args_lua {
 
 PERSIST static void *G, *D;
 
+/* ---------------- early diagnostic ---------------- */
+
+/* Sends a UDP datagram using only the stack and the dlsym pointer.
+   Does not touch any global variable, so it works before the
+   relocation pass has run. */
+static void early_send(u64 eboot, void *dlsym, s32 log_fd,
+                       const u8 *log_sa, const char *msg, int msg_len)
+{
+    if (log_fd < 0 || !log_sa) return;
+
+    char sname[8];
+    sname[0]='s'; sname[1]='e'; sname[2]='n'; sname[3]='d';
+    sname[4]='t'; sname[5]='o'; sname[6]=0; sname[7]=0;
+
+    void *sendto_fn = 0;
+    void *g = (void*)(eboot + GADGET_OFFSET);
+    native_call(g, dlsym, (u64)LIBKERNEL_HANDLE, (u64)sname,
+                (u64)&sendto_fn, 0, 0, 0);
+
+    if (sendto_fn)
+        native_call(g, sendto_fn, (u64)log_fd, (u64)msg,
+                    (u64)msg_len, 0, (u64)log_sa, 16);
+}
+
+static void early_send_hexnum(u64 eboot, void *dlsym, s32 log_fd,
+                              const u8 *log_sa, const char *prefix,
+                              u64 value)
+{
+    char buf[64];
+    int p = 0;
+    while (*prefix && p < 40) buf[p++] = *prefix++;
+
+    char tmp[20]; int t = 0;
+    if (value == 0) tmp[t++] = '0';
+    while (value > 0) {
+        int digit = (int)(value & 0xF);
+        tmp[t++] = (digit < 10) ? ('0' + digit) : ('a' + digit - 10);
+        value >>= 4;
+    }
+    while (t > 0) buf[p++] = tmp[--t];
+    buf[p++] = '\n';
+    early_send(eboot, dlsym, log_fd, log_sa, buf, p);
+}
+
 /* ---------------- ELF relocations ---------------- */
 
 typedef struct {
@@ -30,11 +74,9 @@ typedef struct {
     s64 r_addend;
 } Elf64_Rela;
 
+#define R_X86_64_64       1
 #define R_X86_64_RELATIVE 8
 
-/* Walk __rela_start..__rela_end and rebase every R_X86_64_RELATIVE entry
-   from the link base (0) to the runtime load base.  Must run before any
-   data pointer is dereferenced. */
 static int apply_relocations(void) {
     u64 rs, re, base;
     __asm__ volatile("lea __rela_start(%%rip), %0" : "=r"(rs));
@@ -46,8 +88,13 @@ static int apply_relocations(void) {
     int count = 0;
     for (Elf64_Rela *r = (Elf64_Rela*)rs; (u64)r < re; r++) {
         u32 type = (u32)(r->r_info & 0xFFFFFFFFu);
+        u64 *slot = (u64 *)(base + r->r_offset);
+
         if (type == R_X86_64_RELATIVE) {
-            *(u64 *)(base + r->r_offset) = base + (u64)r->r_addend;
+            *slot = base + (u64)r->r_addend;
+            count++;
+        } else if (type == R_X86_64_64) {
+            *slot += base;
             count++;
         }
     }
@@ -562,14 +609,25 @@ static void *audio_thread_entry(void *arg) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "ENTRY\n", 6);
+
     int nreloc = apply_relocations();
+
+    early_send_hexnum(eboot, dlsym, ext->log_fd, ext->log_sa,
+                      "RELOC ", (u64)nreloc);
 
     G = (void*)(eboot + GADGET_OFFSET);
     D = dlsym;
 
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "VIDEO\n", 6);
+
     if (video_init(eboot) != 0) {
+        early_send(eboot, dlsym, ext->log_fd, ext->log_sa,
+                   "VIDEO FAIL\n", 11);
         for (;;) sleep_ms(1000);
     }
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "LIBC\n", 5);
 
     ps_libc_init(G, D,
         SYM(G, D, LIBKERNEL_HANDLE, "mmap"),
@@ -582,15 +640,24 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
         SYM(G, D, LIBKERNEL_HANDLE, "sendto"),
         ext->log_fd, ext->log_sa);
 
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "PAD\n", 4);
+
     pad_init_from();
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "AUDIO\n", 6);
+
     audio_init_from();
     get_proc_time = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetProcessTime");
     if (get_proc_time) start_us = NC(G, get_proc_time, 0,0,0,0,0,0);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "SAVE\n", 5);
 
     save_init();
     game_init(&game);
     game.vibration_on = 1;
     save_load(&game);
+
+    early_send(eboot, dlsym, ext->log_fd, ext->log_sa, "READY\n", 6);
 
     printf("FlappyBird: relocs=%d video_h=%d pad=%d vib=%d lb=%d save=%d vib_on=%d\n",
            nreloc, video_h, pad_h,
