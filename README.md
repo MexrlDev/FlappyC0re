@@ -65,6 +65,9 @@ Optional: You can turn on debugging logs via Python switch DEBUGLOG from false t
 2. and finally wait till the build completed and download the zip file called `FlappyC0re.zip`
 
 ---
+## Speical thanks
+ - [Egycnq](https://x.com/egycnq?s=11) for [EmuC0re](https://github.com/egycnq/emuc0re) / [DooMC0re](https://github.com/egycnq/DooMC0re) researches
+---
 ## Credits
 
 Game logic ported from [MexrlDev's JS Flappy Bird](https://github.com/MexrlDev/PsVue-Mod/tree/main/Flappy%20Bird). - RIP VUE
@@ -88,8 +91,7 @@ pulse pattern used here — are adapted from **ToolB0x** (MIT, by MexrlDev).
 No ToolB0x source code is copied into this repository; only the API usage
 pattern is reused.
 
-LuaC0re by Gezine. The 8×8 bitmap font is a small public-domain-style
-glyph table; the version here was typed out fresh for this port.
+LuaC0re by Gezine.
 
 ## License
 
