@@ -1,5 +1,5 @@
 Flappy Bird Luac0re PS4/PS5 port
-Copyright (c) w2026 MexrlDev
+Copyright (c) 2026 MexrlDev
 License: MIT
 
 Third-party components and inspirations
@@ -15,9 +15,25 @@ Flappy Bird sprites and audio
 Doom-PS
   Copyright (c) 2026 MexrlDev
   License: MIT
+  Source: https://github.com/MexrlDev/Doom-Ps
   Role: The platform-layer approach used here (single flat RWX mmap,
         streamed .bin over TCP, .ps_persist linker section) is the
         same pattern as Doom-PS. Both projects share an author.
+
+ToolB0x
+  Copyright (c) 2026 MexrlDev
+  Source: https://github.com/MexrlDev/ToolB0x
+  License: MIT
+  Role: The DualSense lightbar control (scePadSetLightBar) and
+        vibration control (scePadSetVibration) patterns used in this
+        port — including the per-game-state colour scheme (orange /
+        yellow / red / rainbow) and the haptic pulse pattern (short
+        low-frequency pulse on flap, sustained high-amplitude pulse
+        on death) — are adapted from ToolB0x. Both projects share
+        an author.
+
+        Only the API usage pattern is reused. No ToolB0x source code
+        is copied into this repository.
 
 DooMC0re
   Copyright (c) EgyDevTeam / egycnq
