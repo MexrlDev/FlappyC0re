@@ -35,17 +35,17 @@ ToolB0x
         Only the API usage pattern is reused. No ToolB0x source code
         is copied into this repository.
 
-DooMC0re
+EmuC0re / DooMC0re
   Copyright (c) EgyDevTeam / egycnq
-  Source: https://github.com/egycnq/EmuC0re
-  License: GPL-2.0
+  Source: https://github.com/egycnq/EmuC0re / https://github.com/egycnq/DooMC0re
+  License: MIT / GPL-2.0
   Role: Architectural inspiration only. Specific ideas borrowed at the
         design level — the native_call trampoline calling convention,
         the .ps_persist / BSS-wipe-survival pattern, and the streamed-
         shellcode launcher — were originally developed or popularised
         by DooMC0re.
 
-        NO DooMC0re SOURCE CODE IS INCLUDED IN THIS REPOSITORY.
+        NO EmuC0re / DooMC0re SOURCE CODE IS INCLUDED IN THIS REPOSITORY.
         Every line of C, Lua, and Python here was written independently
         for this port. If a future change does copy code from DooMC0re,
         that file must be relicensed GPL-2.0-or-later and this NOTICE
