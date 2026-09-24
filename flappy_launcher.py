@@ -2,9 +2,10 @@
 """Flappy Bird PS5 launcher (mirrors the Doom-PS pattern)."""
 import argparse, datetime, os, platform, re, socket, sys, threading, time
 
-DEFAULT_PS4_PS5_IP = ""                             # fill in
+DEFAULT_PS4_PS5_IP = "192.168.1.6"  # fill in with your own ps4/ps5 ip
 DEFAULT_LAUNCHER   = "flappy.lua"
 DEFAULT_SHELLCODE  = "flappy.bin"
+DEBUGLOG = False
 PAYLOAD_PORT       = 9026
 LOG_PORT           = 9027
 SC_PORT_LO         = 5001
@@ -166,9 +167,9 @@ def main():
     ap.add_argument("host", nargs="?", default=DEFAULT_PS4_PS5_IP)
     ap.add_argument("--launcher",  "-l", default=DEFAULT_LAUNCHER)
     ap.add_argument("--shellcode", "-s", default=DEFAULT_SHELLCODE)
-    ap.add_argument("--debug-logs", type=str_to_bool, default=True,
+    ap.add_argument("--debug-logs", type=str_to_bool, default=DEBUGLOG,
                     metavar="true|false",
-                    help="capture UDP debug logs (default: true)")
+                    help=f"capture UDP debug logs (default: {DEBUGLOG})")
     ap.add_argument("--local-ip",  default=None)
     ap.add_argument("--scport",    type=int, default=None)
     a = ap.parse_args()
