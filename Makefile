@@ -1,72 +1,51 @@
-# SPDX-License-Identifier: MIT
+NAME    := flappy
 CC      := gcc
 OBJCOPY := objcopy
-PY      := python3
+PYTHON  ?= python3
+
+SRC_DIR := src
+BUILD   := build
 
 CFLAGS := -m64 -ffreestanding -nostdinc -fPIE \
           -fno-stack-protector -fno-builtin \
           -fno-asynchronous-unwind-tables -fno-unwind-tables \
           -mno-red-zone -fno-omit-frame-pointer \
           -Os -Wall -Wextra -Wno-unused-parameter \
-          -I src
+          -I$(SRC_DIR)
 
 LDFLAGS := -nostdlib -nostartfiles -nodefaultlibs -pie \
-           -Wl,-T,$(CURDIR)/linker.ld \
-           -Wl,--build-id=none
+           -Wl,-T,$(CURDIR)/linker.ld -Wl,--build-id=none
 
-SRC     := $(wildcard src/*.c)
-OBJ     := $(SRC:src/%.c=build/%.o)
-ASM_OBJ := build/assets.o
+SRCS := $(wildcard $(SRC_DIR)/*.c)
+OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SRCS))
 
-TARGET_ELF := flappy.elf
-TARGET_BIN := flappy.bin
-TARGET_HEX := flappy.hex
+.PHONY: all clean hex assets font
 
-ASSET_OUTPUTS := src/assets.h src/assets.bin src/assets.S
-ASSET_SCRIPT  := tools/bake_assets.py
+all: $(NAME).bin
 
-.PHONY: all clean hex assets
+$(BUILD):
+	@mkdir -p $(BUILD)
 
-all: $(TARGET_BIN) $(TARGET_ELF) $(TARGET_HEX)
-
-ifeq ($(wildcard $(ASSET_SCRIPT)),)
-$(error $(ASSET_SCRIPT) not found.  Check with: git ls-files tools/)
-endif
-
-src/.assets.stamp: $(ASSET_SCRIPT) \
-                   $(wildcard assets/*.png) $(wildcard assets/*.wav)
-	@mkdir -p src
-	$(PY) $(ASSET_SCRIPT)
-	@touch $@
-
-$(ASSET_OUTPUTS): src/.assets.stamp
-
-assets: $(ASSET_OUTPUTS)
-
-build:
-	@mkdir -p build
-
-build/%.o: src/%.c $(ASSET_OUTPUTS) | build
+$(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-build/assets.o: src/assets.S $(ASSET_OUTPUTS) | build
-	$(CC) $(CFLAGS) -c $< -o $@
+$(NAME).elf: $(OBJS) linker.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $@
 
-$(TARGET_ELF): $(OBJ) $(ASM_OBJ) linker.ld
-	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(ASM_OBJ)
-
-$(TARGET_BIN): $(TARGET_ELF)
+$(NAME).bin: $(NAME).elf
 	$(OBJCOPY) -O binary $< $@
-	@printf "  elf: %8d bytes\n" $$(stat -c%s $(TARGET_ELF) 2>/dev/null || stat -f%z $(TARGET_ELF))
-	@printf "  bin: %8d bytes\n" $$(stat -c%s $(TARGET_BIN) 2>/dev/null || stat -f%z $(TARGET_BIN))
+	@printf 'Built %s (%s bytes)\n' "$@" "$$(stat -c%s $@ 2>/dev/null || stat -f%z $@)"
 
-$(TARGET_HEX): $(TARGET_BIN)
-	@xxd -p $(TARGET_BIN) | tr -d '\n' > $@
-	@printf "  hex: %8d bytes\n" $$(stat -c%s $(TARGET_HEX) 2>/dev/null || stat -f%z $(TARGET_HEX))
+hex: $(NAME).bin
+	xxd -p $< | tr -d '\n' > $(NAME).hex
+	@printf 'Wrote %s (%s bytes)\n' "$(NAME).hex" "$$(stat -c%s $(NAME).hex 2>/dev/null || stat -f%z $(NAME).hex)"
 
-hex: $(TARGET_HEX)
+assets:
+	$(PYTHON) tools/bake_assets.py
+
+font:
+	$(PYTHON) tools/bake_font.py
 
 clean:
-	rm -rf build
-	rm -f $(TARGET_ELF) $(TARGET_BIN) $(TARGET_HEX)
-	rm -f $(ASSET_OUTPUTS) src/.assets.stamp
+	rm -rf $(BUILD)
+	rm -f $(NAME).elf $(NAME).bin $(NAME).hex
