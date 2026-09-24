@@ -4,15 +4,10 @@
 extern const u8 asset_blob[];
 
 #define NUM_VOICES 32
-#define GRAIN      1024           /* must match the buffer size opened in main.c */
+#define GRAIN      1024
 
-/* Asymmetric fades.  A short fade-in kills the initial click without
-   affecting the attack, and a very short fade-out leaves the natural
-   decay of the source WAV intact.  The previous symmetric 256-sample
-   fade chopped the tail of every SFX and produced an audible "swish"
-   when the score sound played. */
-#define FADE_IN_LEN   128         /* ~2.7 ms at 48 kHz */
-#define FADE_OUT_LEN   48         /* ~1.0 ms at 48 kHz */
+#define FADE_IN_LEN   128
+#define FADE_OUT_LEN   96
 
 struct voice {
     const s16 *pcm;
@@ -68,10 +63,6 @@ void audio_play(enum asset_id id, float vol) {
 
     const s16 *pcm = (const s16*)(asset_blob + a->offset);
 
-    /* One-at-a-time per asset: kill any running instance of the same
-       sound before starting a new one.  Without this, quickly scoring
-       two pipes in a row leaves two overlapping score voices that sum
-       and hit the soft-clipper. */
     for (int i = 0; i < NUM_VOICES; i++) {
         if (voices[i].active && voices[i].pcm == pcm) {
             voices[i].active = 0;
@@ -97,19 +88,25 @@ void audio_play(enum asset_id id, float vol) {
     voices[slot].active = 1;
 }
 
-/* Gentler soft-clip: linear up to ±26000, then 1/2 slope, ceiling
-   around ±29000.  This is transparent for a single voice and only
-   compresses when two or more sounds overlap. */
-static inline int soft_clip(int s) {
-    if (s >  32760) return  32760;
-    if (s < -32760) return -32760;
-    if (s >  26000) return  26000 + (s -  26000) / 2;
-    if (s < -26000) return -26000 + (s +  26000) / 2;
-    return s;
+static inline int soft_clip(int x) {
+    const int KNEE = 22000;
+    const int MAX  = 32760;
+    const int ROOM = MAX - KNEE;
+    if (x > KNEE) {
+        int over = x - KNEE;
+        return KNEE + (int)(((s64)ROOM * over) / (over + ROOM));
+    }
+    if (x < -KNEE) {
+        int over = -x - KNEE;
+        return -(KNEE + (int)(((s64)ROOM * over) / (over + ROOM)));
+    }
+    return x;
 }
 
 void audio_mix_tick(void) {
     if (audio_handle < 0 || !audio_out_fn) return;
+
+    int master = audio_master;
 
     for (int i = 0; i < GRAIN; i++) {
         int acc = 0;
@@ -136,7 +133,7 @@ void audio_mix_tick(void) {
             acc += (int)(sample * gain);
         }
 
-        acc = (acc * audio_master) / 100;
+        acc = (acc * master) / 100;
         acc = soft_clip(acc);
 
         mix_buf[i*2]   = (s16)acc;
