@@ -1,6 +1,10 @@
+# FlappyC0re
+* [The Big One!](https://youtu.be/VHOCPpjUtD8?si=mlzagng2nm-eBmUX)
+
+---
 ## Credits
 
-Game logic ported from [MexrlDev's JS Flappy Bird](https://github.com/MexrlDev/PsVue-Mod/tree/main/Flappy%20Bird).
+Game logic ported from [MexrlDev's JS Flappy Bird](https://github.com/MexrlDev/PsVue-Mod/tree/main/Flappy%20Bird). - RIP VUE
 
 Sprites and audio are from
 [samuelcust/flappy-bird-assets](https://github.com/samuelcust/flappy-bird-assets)
