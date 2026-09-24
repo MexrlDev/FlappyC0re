@@ -2,6 +2,27 @@
 * [The Big One!](https://youtu.be/VHOCPpjUtD8?si=mlzagng2nm-eBmUX)
 
 ---
+## Controls
+
+| Button | Function |
+| ------ | -------- |
+| Cross (X) | Jump (In Game) Select/Resume (Menu/Pause) |
+| Circle (O) | Back (In Game Start Only) Back (Menu/Pause) |
+| D-Pad | Navigation (menu) |
+| Options button | Pause/Resume (In Game) |
+
+---
+## Setup
+1. Get the release zip, or copy the lua/py from the source code from this repo
+2. In Pythonica/PyCode for mobile go to SetUp for mobile
+3. for pc just start it via going to Python and starting it via shellcode Python3 flappy_launcher.py
+
+---
+## How to build it
+1. Use YML to build from actions
+2. and finally wait till the build completed and download the zip file called `FlappyC0re.zip`
+
+---
 ## Credits
 
 Game logic ported from [MexrlDev's JS Flappy Bird](https://github.com/MexrlDev/PsVue-Mod/tree/main/Flappy%20Bird). - RIP VUE
