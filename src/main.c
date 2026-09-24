@@ -8,8 +8,8 @@
 #include "save.h"
 
 struct ext_args_lua {
-    u64 eboot;
-    u64 r0;
+    u64 status;
+    u64 step;
     u32 frame;
     u32 pad;
     s32 log_fd;
