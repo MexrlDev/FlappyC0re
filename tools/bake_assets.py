@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Bake PNG + WAV assets into a single blob + header.
 
-PNGs are quantized to 8-bit indexed.  WAVs are downmixed to mono S16
-and resampled to 48 kHz.
+PNGs are quantized to 8-bit indexed with a 1 KB RGBA palette.
+WAVs are downmixed to mono S16 and resampled to 48 kHz.
 """
 import os, sys, wave, struct
 from PIL import Image
 
 ASSETS = [
-    # name          path                                       kind
     ("bg_day",     "assets/background-day.png",                 "png"),
     ("bg_night",   "assets/background-night.png",               "png"),
     ("base",       "assets/base.png",                           "png"),
@@ -23,62 +23,67 @@ ASSETS = [
     ("sfx_hit",    "assets/hit.wav",                            "wav"),
 ]
 
-FMT_RGBA8_INDEXED = 0   # 1 KB palette + W*H indices
-FMT_S16_MONO_48K  = 1   # raw PCM
+FMT_RGBA8_INDEXED = 0
+FMT_S16_MONO_48K  = 1
+
 
 def resample_mono_48k(in_rate, samples):
-    if in_rate == 48000:
+    """samples is raw mono S16.  Returns raw mono S16 at 48 kHz."""
+    n_frames = len(samples) // 2
+    if in_rate == 48000 or n_frames == 0:
         return samples
-    out_len = int(len(samples) * 48000 / in_rate)
+
+    out_len = int(n_frames * 48000 / in_rate)
     out = bytearray(out_len * 2)
     for i in range(out_len):
-        src = i * in_rate / 48000
-        a = int(src); b = min(a + 1, len(samples) - 1)
+        src = i * in_rate / 48000.0
+        a = int(src)
+        if a >= n_frames:
+            a = n_frames - 1
+        b = a + 1 if a + 1 < n_frames else a
         frac = src - a
+
         va = struct.unpack_from("<h", samples, a * 2)[0]
         vb = struct.unpack_from("<h", samples, b * 2)[0]
         v = int(va + (vb - va) * frac)
+        if v > 32767:  v = 32767
+        if v < -32768: v = -32768
         struct.pack_into("<h", out, i * 2, v)
     return bytes(out)
+
 
 def bake_png(path):
     img = Image.open(path).convert("RGBA")
     w, h = img.size
-    # quantize to 256 colors, keeping alpha
+
     alpha = img.split()[3]
     rgb = img.convert("RGB")
     pal = rgb.quantize(colors=256, method=Image.MEDIANCUT, dither=Image.NONE)
-    palette = pal.getpalette()[:256*3]
+    palette = pal.getpalette()[:256 * 3]
     indices = pal.tobytes()
 
-    # If the source has real transparency (alpha channel varies), keep
-    # RGBA and just store the 8-bit RGB palette + 1-bit alpha mask we
-    # treat as "opaque unless index == 0".  Simpler: force palette
-    # entry 0 to be fully transparent and remap.
     has_alpha = alpha.getextrema()[0] < 255
     pal_rgba = bytearray(256 * 4)
     for i in range(256):
-        r = palette[i*3]   if i*3+2 < len(palette) else 0
-        g = palette[i*3+1] if i*3+2 < len(palette) else 0
-        b = palette[i*3+2] if i*3+2 < len(palette) else 0
-        a = 255
-        if has_alpha:
-            # keep original alpha semantics: index 0 -> transparent
-            a = 0 if i == 0 else 255
+        r = palette[i*3]   if i*3 + 2 < len(palette) else 0
+        g = palette[i*3+1] if i*3 + 2 < len(palette) else 0
+        b = palette[i*3+2] if i*3 + 2 < len(palette) else 0
+        a = 0 if (has_alpha and i == 0) else 255
         pal_rgba[i*4+0] = r
         pal_rgba[i*4+1] = g
         pal_rgba[i*4+2] = b
         pal_rgba[i*4+3] = a
 
-    # If source had alpha, we need to remap any pixel with a==0 to index 0.
     if has_alpha:
         ap = alpha.tobytes()
         idx = bytearray(indices)
         for i, a in enumerate(ap):
-            if a < 128: idx[i] = 0
+            if a < 128:
+                idx[i] = 0
         indices = bytes(idx)
 
     return (bytes(pal_rgba), indices, w, h)
+
 
 def bake_wav(path):
     with wave.open(path, "rb") as wf:
@@ -87,27 +92,32 @@ def bake_wav(path):
         rate = wf.getframerate()
         n = wf.getnframes()
         raw = wf.readframes(n)
-    assert sw == 2, f"{path}: only 16-bit WAVs supported"
+
+    if sw != 2:
+        raise ValueError(f"{path}: only 16-bit WAVs supported")
     if ch == 2:
-        # downmix to mono
         mono = bytearray(n * 2)
         for i in range(n):
-            l = struct.unpack_from("<h", raw, i*4)[0]
-            r = struct.unpack_from("<h", raw, i*4+2)[0]
-            struct.pack_into("<h", mono, i*2, (l + r) // 2)
+            l = struct.unpack_from("<h", raw, i * 4)[0]
+            r = struct.unpack_from("<h", raw, i * 4 + 2)[0]
+            struct.pack_into("<h", mono, i * 2, (l + r) // 2)
         raw = bytes(mono)
     elif ch != 1:
         raise ValueError(f"{path}: unsupported channel count {ch}")
+
     raw = resample_mono_48k(rate, raw)
     return (raw, 48000, len(raw) // 2)
+
 
 def main():
     blob = bytearray()
     entries = []
+
     for name, path, kind in ASSETS:
         if not os.path.isfile(path):
             print(f"[!] missing {path}", file=sys.stderr)
             sys.exit(1)
+
         if kind == "png":
             pal, idx, w, h = bake_png(path)
             off = len(blob)
@@ -122,6 +132,7 @@ def main():
             print(f"  {name:10s} WAV {rate}Hz  {frames} frames  {len(pcm):>8d} B")
 
     with open("src/assets.h", "w") as f:
+        f.write("/* SPDX-License-Identifier: MIT */\n")
         f.write("/* generated by tools/bake_assets.py -- do not edit */\n")
         f.write("#ifndef ASSETS_H\n#define ASSETS_H\n\n#include \"core.h\"\n\n")
         f.write("#define ASSET_FMT_RGBA8_INDEXED 0\n")
@@ -144,6 +155,7 @@ def main():
         f.write(blob)
 
     with open("src/assets.S", "w") as f:
+        f.write("/* SPDX-License-Identifier: MIT */\n")
         f.write(".section .rodata\n")
         f.write(".global asset_blob\n")
         f.write(".global asset_blob_end\n")
@@ -153,6 +165,7 @@ def main():
         f.write("asset_blob_end:\n")
 
     print(f"\nbaked {len(entries)} assets, {len(blob)} bytes total")
+
 
 if __name__ == "__main__":
     main()
