@@ -14,9 +14,6 @@
 
 #define MAX_RAMP_SPEED 12.0f
 #define RAMP_STEP      0.25f
-
-/* Minimum pixels of top pipe that must remain visible on screen so the
-   gap is never so high that the top pipe disappears entirely. */
 #define MIN_TOP_PIPE_VISIBLE 45.0f
 
 const char *game_diff_name(enum diff d) {
@@ -85,9 +82,6 @@ static u32 rng_next(void) {
 }
 
 static void spawn_pipe(struct game *g) {
-    /* Clamp the gap center so the top pipe's bottom edge is always at
-       least MIN_TOP_PIPE_VISIBLE pixels down from the top of the
-       screen, and the bottom pipe's top edge is never past the ground. */
     float min_gap_y = g->pipe_gap + MIN_TOP_PIPE_VISIBLE;
     float max_gap_y = SCREEN_H_F - GROUND_H_F - g->pipe_gap - 10.0f;
     if (max_gap_y < min_gap_y) max_gap_y = min_gap_y;
@@ -115,6 +109,7 @@ void game_init(struct game *g) {
     g->menu_cursor = 0;
     g->show_credits = 0;
     g->vibration_on = 1;
+    g->sfx_volume   = 100;
     game_set_diff(g, DIFF_NORMAL);
     g->is_night = 0;
     g->score = 0;
