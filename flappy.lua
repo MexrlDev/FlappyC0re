@@ -2,10 +2,13 @@
   flappy.lua -- LuaC0re payload for Flappy Bird PS5
 ]]
 
-local PC_IP        = "192.168.1.100"   -- <<< EDIT: your PC's IP
+local PC_IP        = "__PC_IP__"
 local LOG_PORT     = 9027
 local SC_PORT_BASE = 5001
 local SC_PORT_MAX  = 5020
+
+-- Enable logging only if PC_IP is a real IPv4 address
+local HAVE_LOGS = (PC_IP:match("^%d+%.%d+%.%d+%.%d+$") ~= nil)
 
 init_dlsym()
 sceMsgDialogTerminate()
@@ -24,11 +27,16 @@ local function make_sockaddr_in(port, ip)
     return sa
 end
 
-local log_sock = create_socket(AF_INET, SOCK_DGRAM, 0)
-local log_sa   = make_sockaddr_in(LOG_PORT, PC_IP)
+local log_sock = -1
+local log_sa   = nil
+
+if HAVE_LOGS then
+    log_sock = create_socket(AF_INET, SOCK_DGRAM, 0)
+    log_sa   = make_sockaddr_in(LOG_PORT, PC_IP)
+end
 
 local function ulog(m)
-    if log_sock >= 0 then
+    if HAVE_LOGS and log_sock >= 0 and log_sa then
         syscall.sendto(log_sock, m .. "\n", #m + 1, 0, log_sa, 16)
     end
 end
@@ -116,7 +124,9 @@ memset(ext, 0, 0x80)
 write64(ext + 0x00, 0xDEAD)
 write32(ext + 0x18, log_sock)
 write32(ext + 0x1C, -1)
-for i = 0, 15 do write8(ext + 0x20 + i, read8(log_sa + i)) end
+if log_sa then
+    for i = 0, 15 do write8(ext + 0x20 + i, read8(log_sa + i)) end
+end
 
 ulog("entering shellcode at 0x" .. string.format("%x", rx))
 func_wrap(rx)(EBOOT_BASE, SCE_KERNEL_DLSYM, ext)
