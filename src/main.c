@@ -33,7 +33,7 @@ PERSIST static void *g_aud_open_fn  = 0;
 PERSIST static void *g_aud_out_fn   = 0;
 PERSIST static void *g_aud_mod      = 0;
 
-PERSIST static u8 g_aud_actual_port = 0;
+PERSIST static u8 g_aud_actual_port = 2;
 
 PERSIST static s32 g_pad_mod = -1;
 
@@ -402,11 +402,12 @@ static int audio_sweep_stale_handles(void) {
     return released;
 }
 
-#define PORT_TV       0
+#define PORT_TV       2
 #define PORT_HEADSET  3
 
-static int port_is_valid(u8 p) {
-    return p == PORT_TV || p == PORT_HEADSET;
+static u8 port_normalize(u8 p) {
+    if (p == PORT_HEADSET) return PORT_HEADSET;
+    return PORT_TV;
 }
 
 static void audio_init_from(void) {
@@ -432,10 +433,8 @@ static void audio_init_from(void) {
     printf("audio: released %d stale handles\n", released);
     if (released > 0) sleep_ms(150);
 
-    u8 preferred = game.audio_port;
-    if (!port_is_valid(preferred)) preferred = PORT_TV;
-
-    u8 other = (preferred == PORT_TV) ? PORT_HEADSET : PORT_TV;
+    u8 preferred = port_normalize(game.audio_port);
+    u8 other     = (preferred == PORT_TV) ? PORT_HEADSET : PORT_TV;
 
     s32 h = -1;
     u8  opened = preferred;
@@ -472,7 +471,7 @@ static void audio_init_from(void) {
 }
 
 static void audio_restart_with_port(u8 new_port) {
-    if (!port_is_valid(new_port)) new_port = PORT_TV;
+    new_port = port_normalize(new_port);
     if (!g_aud_open_fn || !g_aud_close_fn) return;
 
     printf("audio: restart -> port %u (%s)\n",
@@ -557,92 +556,26 @@ static void pad_init_from(void) {
            pad_h, (void*)pad_lb_fn);
 }
 
-static void run_audio_diagnostic(void) {
-    printf("diag: ===== AUDIO DIAGNOSTIC START =====\n");
-    printf("diag: pad_mod=%d aud_mod=%d\n",
-           g_pad_mod, (s32)(s64)g_aud_mod);
+static void reset_settings_to_default(void) {
+    printf("reset: restoring defaults\n");
 
-    static const char *pad_syms[] = {
-        "scePadSetAudioOut",
-        "scePadAudioOutOpen",
-        "scePadAudioOutClose",
-        "scePadAudioOutOutput",
-        "scePadSetAudioOutput",
-        "scePadSetAudioRoute",
-        "scePadSetAudioDevice",
-        "scePadSetAudioControl",
-        "scePadSetSpeaker",
-        "scePadSetSpeakerMode",
-        "scePadSetSpeakerVolume",
-        "scePadSetVoiceOutput",
-        "scePadGetAudioOutState",
-        "scePadGetSpeakerState",
-        "scePadSetVibration",
-        "scePadSetLightBar",
-        "scePadSetTriggerEffect",
-        "scePadResetOrientation",
-        "scePadSetMotionSensorState",
-        "scePadSetTiltCorrectionState",
-        "scePadSetAngularVelocityDeadbandState",
-        "scePadGetControllerInformation",
-        "scePadGetExtControllerInformation",
-        "scePadGetDeviceInfo",
-        "scePadGetDeviceInfoForPadHandle",
-        "scePadGetConnectionState",
-        "scePadGetHandleForDevice",
-        "scePadSetVibrationMode",
-        "scePadGetFeatureReport",
-        "scePadSetFeatureReport",
-        "scePadDeviceClassGetExtendedDeviceInfo",
-        "scePadDeviceClassGetDeviceClass",
-        "scePadDeviceClassGetExtendedData",
-    };
-    int n_sym = (int)(sizeof(pad_syms) / sizeof(pad_syms[0]));
-    printf("diag: probing %d libScePad symbols\n", n_sym);
-    for (int i = 0; i < n_sym; i++) {
-        void *fn = g_pad_mod > 0
-            ? SYM(G, D, g_pad_mod, pad_syms[i])
-            : 0;
-        printf("diag: pad  %-40s %p\n", pad_syms[i], fn);
+    game_set_diff(&game, DIFF_NORMAL);
+    game.is_night    = 0;
+    game.vibration_on = 1;
+    game.sfx_volume   = 100;
+    game.screen_mode  = SCREEN_FULL;
+
+    audio_set_master(game.sfx_volume);
+    haptic_apply_toggle();
+
+    u8 target_port = PORT_TV;
+    if (game.audio_port != target_port) {
+        audio_restart_with_port(target_port);
+    } else {
+        game.audio_port = target_port;
     }
 
-    static const char *aud_syms[] = {
-        "sceAudioOutOpen",
-        "sceAudioOutClose",
-        "sceAudioOutOutput",
-        "sceAudioOutOutputs",
-        "sceAudioOutSetVolume",
-        "sceAudioOutSetMixLevelPadSpk",
-        "sceAudioOutSetMixLevel",
-        "sceAudioOutGetPortState",
-        "sceAudioOutInit",
-        "sceAudioOutGetSystemState",
-        "sceAudioOutSetCompressor",
-        "sceAudioOutSetPadSpeakerVolume",
-    };
-    int n_aud = (int)(sizeof(aud_syms) / sizeof(aud_syms[0]));
-    printf("diag: probing %d libSceAudioOut symbols\n", n_aud);
-    s32 amod = (s32)(s64)g_aud_mod;
-    for (int i = 0; i < n_aud; i++) {
-        void *fn = amod > 0 ? SYM(G, D, amod, aud_syms[i]) : 0;
-        printf("diag: aud  %-40s %p\n", aud_syms[i], fn);
-    }
-
-    if (g_aud_open_fn && g_aud_close_fn) {
-        printf("diag: port sweep 0..15\n");
-        for (s32 type = 0; type < 16; type++) {
-            s32 h = (s32)NC(G, g_aud_open_fn,
-                            (u64)(s64)g_user_id, (u64)(s64)type,
-                            0, 1024, SAMPLE_RATE, AUDIO_S16_STEREO);
-            printf("diag: open type=%2d -> %10d (0x%08x)\n",
-                   (int)type, (int)h, (unsigned)h);
-            if (h >= 0) {
-                NC(G, g_aud_close_fn, (u64)h, 0,0,0,0,0);
-            }
-        }
-    }
-
-    printf("diag: ===== AUDIO DIAGNOSTIC END =====\n");
+    save_write(&game);
 }
 
 static const char *menu_items[] = {
@@ -655,7 +588,7 @@ static const char *menu_items[] = {
     "SCREEN",
     "RESET SCORE",
     "SAVE STATUS",
-    "AUDIO DIAGNOSTIC",
+    "RESET SETTINGS",
     "CREDITS",
     "EXIT",
 };
@@ -881,7 +814,7 @@ static void menu_update(u32 pressed) {
         case 8:
             break;
         case 9:
-            run_audio_diagnostic();
+            reset_settings_to_default();
             break;
         case 10:
             game.show_credits = 1;
@@ -1054,7 +987,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     g_aud_open_fn     = 0;
     g_aud_out_fn      = 0;
     g_aud_mod         = 0;
-    g_aud_actual_port = 0;
+    g_aud_actual_port = 2;
     g_pad_mod         = -1;
     g_pad_fails       = 0;
     pad_prev          = 0;
@@ -1109,7 +1042,7 @@ void _start(u64 eboot, void *dlsym, struct ext_args_lua *ext) {
     game.audio_port   = PORT_TV;
     save_load(&game);
 
-    if (!port_is_valid(game.audio_port)) game.audio_port = PORT_TV;
+    game.audio_port = port_normalize(game.audio_port);
 
     audio_set_master(game.sfx_volume);
 
