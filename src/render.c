@@ -81,11 +81,6 @@ static const struct asset *get_asset(int id) {
     return &asset_table[id];
 }
 
-/* Source-major scaled blit.  Alpha of the palette entry is treated as
-   binary: exactly zero → skip, anything else → fully opaque.  This is
-   the fix for the "blank spots" — the previous cutoff of 32 was culling
-   real pixels whose palette alpha happened to be low (the PNG edges
-   quantized to alpha 5-30 in the palette). */
 static void blit_indexed_fp(const u8 *pal, const u8 *idx,
                             int src_w, int src_h,
                             int dst_x, int dst_y,
@@ -208,7 +203,7 @@ void render_blit_scaled_bg_fp(int id, float xf, int scale_fp) {
     if (eff_scale_fp < 1) eff_scale_fp = 1;
 
     int x0 = (int)(xf * g_vscale + g_voffx + 0.5f);
-    int dst_w = ((int)a->w * eff_scale_fp + 128) >> 8;
+    int dst_w = ((int)a->w * eff_scale_fp + 255) >> 8;
     int dst_h = ((int)a->h * eff_scale_fp + 128) >> 8;
 
     const u8 *pal = asset_blob + a->offset;
