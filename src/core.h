@@ -75,6 +75,7 @@ static void *nc_sym_lookup(void *gate, void *dlsym,
 }
 
 #define NC             nc_call_gate
+#define STATIC_ASSERT(cond, msg) _Static_assert((cond), msg)
 #define SYM            nc_sym_lookup
 #define native_call    nc_call_gate
 #define resolve_sym    nc_sym_lookup
