@@ -2,6 +2,9 @@
 #include "font_aa.h"
 #include "font_aa_metrics.h"
 
+STATIC_ASSERT(sizeof(struct font_aa_glyph) == 16,
+              "font_aa_glyph must be 16 bytes (s16,s16,u16,u16,u16,u32 + pad)");
+
 __asm__(
     ".section .rodata\n"
     ".globl font_aa_bitmap\n"
@@ -26,8 +29,10 @@ static u8 sample_bilinear(const u8 *src, int src_w, int src_h,
 
     if (x0 < 0) { x0 = 0; tx = 0; }
     if (y0 < 0) { y0 = 0; ty = 0; }
+
     int x1 = x0 + 1;
     int y1 = y0 + 1;
+
     if (x0 >= src_w) x0 = src_w - 1;
     if (y0 >= src_h) y0 = src_h - 1;
     if (x1 >= src_w) x1 = src_w - 1;
@@ -49,6 +54,7 @@ void font_aa_draw(u32 *fb, int x0, int y0, const char *s,
     if (!s || !*s) return;
     if (target_h < 4) target_h = 4;
 
+    /* Fixed-point scale: 16.16, so 1.0 == 65536. */
     u32 scale = ((u32)target_h << 16) / (u32)FONT_AA_PX_HEIGHT;
     int pen_x = x0;
 
@@ -58,9 +64,6 @@ void font_aa_draw(u32 *fb, int x0, int y0, const char *s,
         const struct font_aa_glyph *g = &font_aa_metrics[ch - 32];
 
         if (g->w && g->h) {
-            /* THE FIX: use the precomputed byte offset.  Do NOT walk
-               the atlas glyph-by-glyph as we draw — the string order
-               is unrelated to the atlas order. */
             const u8 *glyph_src = font_aa_bitmap + g->off;
 
             int gx = pen_x + (int)(((s64)g->bx * (s64)scale) >> 16);
