@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
-"""Bake an anti-aliased ASCII font with proper baseline alignment."""
+"""
+Bake an anti-aliased ASCII font with proper baseline alignment.
+
+Produces:
+    src/font_aa.bin         row-major alpha bitmap, one byte per pixel
+    src/font_aa_metrics.h   per-glyph bbox + advance + byte offset
+
+Layout of the baked cell (per glyph):
+    PX_HEIGHT = 40 px tall
+    CELL_W    = 48 px wide (extra room for wide glyphs)
+    baseline  sits at BASELINE_Y = 40 inside the cell
+
+The metric stored as `bx` is the LEFT-SIDE BEARING (the horizontal
+distance from the pen origin to the first visible pixel), NOT the raw
+cell-relative position.  Storing the bearing matches PIL's own
+`draw.text(..., anchor="ls")` behaviour and makes the advance values
+line up correctly on screen.
+"""
 import os
 from PIL import Image, ImageDraw, ImageFont
 
 PX_HEIGHT  = 40
 CELL_W     = 48
 CELL_H     = 56
-BASELINE_Y = 40          # baseline row inside the cell
-PAD_X      = 2
+BASELINE_Y = 40          # row inside the cell where the baseline sits
+PAD_X      = 2           # left margin used only to prevent bake clipping
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -22,11 +39,12 @@ FONT_CANDIDATES = [
     "/Library/Fonts/Arial.ttf",
 ]
 
+
 def find_font():
     for p in FONT_CANDIDATES:
         if os.path.exists(p):
             return p
-    for root in ["/usr/share/fonts", "/usr/local/share/fonts"]:
+    for root in ("/usr/share/fonts", "/usr/local/share/fonts"):
         if not os.path.isdir(root):
             continue
         for dirpath, _, files in os.walk(root):
@@ -34,6 +52,7 @@ def find_font():
                 if fn.lower().endswith((".ttf", ".otf")):
                     return os.path.join(dirpath, fn)
     raise RuntimeError("No TTF font found")
+
 
 def bake():
     font_path = find_font()
@@ -44,23 +63,46 @@ def bake():
     metrics = []
     off = 0
 
+    # Detect anchor support once.  Pillow >= 8.0 has it; if we're on
+    # an older version, we place glyphs manually using font metrics.
+    have_anchor = True
+    try:
+        test = Image.new("L", (8, 8), 0)
+        ImageDraw.Draw(test).text((0, 0), "x", fill=255,
+                                  font=font, anchor="ls")
+    except (TypeError, ValueError):
+        have_anchor = False
+
+    if not have_anchor:
+        ascent, _descent = font.getmetrics()
+        print(f"  Pillow lacks anchor support — using metric fallback "
+              f"(ascent={ascent})")
+
     for code in range(32, 128):
         ch  = chr(code)
         img = Image.new("L", (CELL_W, CELL_H), 0)
         draw = ImageDraw.Draw(img)
 
-        # Baseline-anchored rendering: every glyph shares the same baseline
-        # so 'e' and 'M' and 'y' align correctly.
-        try:
-            draw.text((PAD_X, BASELINE_Y), ch, fill=255, font=font, anchor="ls")
-        except (TypeError, ValueError):
-            # Older Pillow: fall back to default (left, ascender) which is
-            # also baseline-consistent.
-            draw.text((PAD_X, 0), ch, fill=255, font=font)
+        if have_anchor:
+            draw.text((PAD_X, BASELINE_Y), ch, fill=255,
+                      font=font, anchor="ls")
+        else:
+            # Manual placement: put the baseline at BASELINE_Y by
+            # shifting the origin up by the font's ascender.
+            ascent, _descent = font.getmetrics()
+            draw.text((PAD_X, BASELINE_Y - ascent), ch,
+                      fill=255, font=font)
 
         bbox = img.getbbox()
         if bbox is None:
-            metrics.append((0, 0, 0, 0, PX_HEIGHT // 2, off))
+            # Non-rendering glyph (e.g. space).  Store advance only.
+            try:
+                adv = int(round(font.getlength(ch)))
+            except AttributeError:
+                adv = PX_HEIGHT // 2
+            if adv < 1:   adv = 1
+            if adv > 255: adv = 255
+            metrics.append((0, 0, 0, 0, adv, off))
             continue
 
         min_x, min_y, max_x, max_y = bbox
@@ -79,8 +121,18 @@ def bake():
         if adv < 1:   adv = 1
         if adv > 255: adv = 255
 
-        metrics.append((min_x, min_y, gw, gh, adv, off))
+        # Store the LEFT-SIDE BEARING, not the raw cell-relative x.
+        # Subtracting PAD_X turns "position inside the bake cell" into
+        # "distance from the pen origin to the first visible pixel",
+        # which is exactly what the C-side renderer wants.
+        bx = min_x - PAD_X
+
+        metrics.append((bx, min_y, gw, gh, adv, off))
         off += gw * gh
+
+    # Sanity: total offsets must equal bitmap length
+    assert off == len(bitmap), (
+        f"internal inconsistency: off={off} bitmap={len(bitmap)}")
 
     os.makedirs("src", exist_ok=True)
     with open("src/font_aa.bin", "wb") as f:
@@ -92,14 +144,24 @@ def bake():
         f.write('#include "core.h"\n\n')
         f.write(f"#define FONT_AA_PX_HEIGHT {PX_HEIGHT}\n")
         f.write(f"#define FONT_AA_BITMAP_BYTES {off}\n\n")
-        f.write("struct font_aa_glyph { s16 bx, by; u16 w, h, adv; u32 off; };\n\n")
-        f.write("static const struct font_aa_glyph font_aa_metrics[96] = {\n")
+        f.write("struct font_aa_glyph {\n"
+                "    s16 bx;      /* left-side bearing from pen origin */\n"
+                "    s16 by;      /* top offset from the cell top      */\n"
+                "    u16 w;       /* glyph bitmap width                */\n"
+                "    u16 h;       /* glyph bitmap height               */\n"
+                "    u16 adv;     /* pen advance after this glyph      */\n"
+                "    u32 off;     /* byte offset into font_aa_bitmap   */\n"
+                "};\n\n")
+        f.write("static const struct font_aa_glyph "
+                "font_aa_metrics[96] = {\n")
         for m in metrics:
             f.write(f"    {{{m[0]}, {m[1]}, {m[2]}, {m[3]}, {m[4]}, {m[5]}}},\n")
         f.write("};\n\n#endif\n")
 
     print(f"Wrote src/font_aa.bin ({len(bitmap)} bytes)")
-    print(f"Wrote src/font_aa_metrics.h ({len(metrics)} glyphs, atlas bytes={off})")
+    print(f"Wrote src/font_aa_metrics.h ({len(metrics)} glyphs, "
+          f"atlas bytes={off})")
+
 
 if __name__ == "__main__":
     bake()
