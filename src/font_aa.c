@@ -3,7 +3,7 @@
 #include "font_aa_metrics.h"
 
 STATIC_ASSERT(sizeof(struct font_aa_glyph) == 16,
-              "font_aa_glyph must be 16 bytes (s16,s16,u16,u16,u16,u32 + pad)");
+              "font_aa_glyph must be 16 bytes");
 
 __asm__(
     ".section .rodata\n"
@@ -54,9 +54,12 @@ void font_aa_draw(u32 *fb, int x0, int y0, const char *s,
     if (!s || !*s) return;
     if (target_h < 4) target_h = 4;
 
-    /* Fixed-point scale: 16.16, so 1.0 == 65536. */
     u32 scale = ((u32)target_h << 16) / (u32)FONT_AA_PX_HEIGHT;
     int pen_x = x0;
+
+    u32 cr = (color >> 16) & 0xFF;
+    u32 cg = (color >>  8) & 0xFF;
+    u32 cb =  color        & 0xFF;
 
     for (const char *p = s; *p; p++) {
         unsigned char ch = (unsigned char)*p;
@@ -96,12 +99,9 @@ void font_aa_draw(u32 *fb, int x0, int y0, const char *s,
 
                     u32 dst = row[px];
                     u32 inv = 255 - a;
-                    u32 cr  = (color >> 16) & 0xFF;
-                    u32 cg  = (color >>  8) & 0xFF;
-                    u32 cb  =  color        & 0xFF;
-                    u32 dr  = (dst   >> 16) & 0xFF;
-                    u32 dg  = (dst   >>  8) & 0xFF;
-                    u32 db  =  dst          & 0xFF;
+                    u32 dr  = (dst >> 16) & 0xFF;
+                    u32 dg  = (dst >>  8) & 0xFF;
+                    u32 db  =  dst        & 0xFF;
                     u32 r   = (cr * a + dr * inv) / 255;
                     u32 gg  = (cg * a + dg * inv) / 255;
                     u32 b   = (cb * a + db * inv) / 255;
