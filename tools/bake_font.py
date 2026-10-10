@@ -6,16 +6,15 @@ Produces:
     src/font_aa.bin         row-major alpha bitmap, one byte per pixel
     src/font_aa_metrics.h   per-glyph bbox + advance + byte offset
 
-Layout of the baked cell (per glyph):
-    PX_HEIGHT = 40 px tall
-    CELL_W    = 48 px wide (extra room for wide glyphs)
+Baking layout (per glyph):
+    PX_HEIGHT = 40 px tall cell
+    CELL_W    = 48 px wide cell
     baseline  sits at BASELINE_Y = 40 inside the cell
 
-The metric stored as `bx` is the LEFT-SIDE BEARING (the horizontal
-distance from the pen origin to the first visible pixel), NOT the raw
-cell-relative position.  Storing the bearing matches PIL's own
-`draw.text(..., anchor="ls")` behaviour and makes the advance values
-line up correctly on screen.
+Stored metrics are relative to the pen origin and the shared baseline
+of the text line, NOT to the bake cell.  Keeping `by` baseline-relative
+is what makes every glyph line up on a single shared baseline at draw
+time using only: gy = y0 + (by * scale) >> 16
 """
 import os
 from PIL import Image, ImageDraw, ImageFont
@@ -23,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont
 PX_HEIGHT  = 40
 CELL_W     = 48
 CELL_H     = 56
-BASELINE_Y = 40          # row inside the cell where the baseline sits
-PAD_X      = 2           # left margin used only to prevent bake clipping
+BASELINE_Y = 40
+PAD_X      = 4
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -63,8 +62,6 @@ def bake():
     metrics = []
     off = 0
 
-    # Detect anchor support once.  Pillow >= 8.0 has it; if we're on
-    # an older version, we place glyphs manually using font metrics.
     have_anchor = True
     try:
         test = Image.new("L", (8, 8), 0)
@@ -75,27 +72,24 @@ def bake():
 
     if not have_anchor:
         ascent, _descent = font.getmetrics()
-        print(f"  Pillow lacks anchor support — using metric fallback "
+        print(f"  Pillow lacks anchor support - using metric fallback "
               f"(ascent={ascent})")
 
     for code in range(32, 128):
-        ch  = chr(code)
-        img = Image.new("L", (CELL_W, CELL_H), 0)
+        ch   = chr(code)
+        img  = Image.new("L", (CELL_W, CELL_H), 0)
         draw = ImageDraw.Draw(img)
 
         if have_anchor:
             draw.text((PAD_X, BASELINE_Y), ch, fill=255,
                       font=font, anchor="ls")
         else:
-            # Manual placement: put the baseline at BASELINE_Y by
-            # shifting the origin up by the font's ascender.
             ascent, _descent = font.getmetrics()
             draw.text((PAD_X, BASELINE_Y - ascent), ch,
                       fill=255, font=font)
 
         bbox = img.getbbox()
         if bbox is None:
-            # Non-rendering glyph (e.g. space).  Store advance only.
             try:
                 adv = int(round(font.getlength(ch)))
             except AttributeError:
@@ -115,22 +109,28 @@ def bake():
                 bitmap.append(pixels[px, py])
 
         try:
-            adv = int(round(font.getlength(ch)))
+            natural_adv = int(round(font.getlength(ch)))
         except AttributeError:
-            adv = max_x - min_x
+            natural_adv = max_x - min_x
+
+        bx = min_x - PAD_X
+        by = min_y - BASELINE_Y
+
+        if ch == '_':
+            bx  = 0
+            adv = gw + 1
+        elif ch == '-':
+            bx  = 0
+            adv = gw + 2
+        else:
+            adv = natural_adv
+
         if adv < 1:   adv = 1
         if adv > 255: adv = 255
 
-        # Store the LEFT-SIDE BEARING, not the raw cell-relative x.
-        # Subtracting PAD_X turns "position inside the bake cell" into
-        # "distance from the pen origin to the first visible pixel",
-        # which is exactly what the C-side renderer wants.
-        bx = min_x - PAD_X
-
-        metrics.append((bx, min_y, gw, gh, adv, off))
+        metrics.append((bx, by, gw, gh, adv, off))
         off += gw * gh
 
-    # Sanity: total offsets must equal bitmap length
     assert off == len(bitmap), (
         f"internal inconsistency: off={off} bitmap={len(bitmap)}")
 
@@ -144,13 +144,24 @@ def bake():
         f.write('#include "core.h"\n\n')
         f.write(f"#define FONT_AA_PX_HEIGHT {PX_HEIGHT}\n")
         f.write(f"#define FONT_AA_BITMAP_BYTES {off}\n\n")
+        f.write("/*\n"
+                " * All fields are relative to the pen origin and the\n"
+                " * shared baseline of the text line, NOT to the bake cell.\n"
+                " *\n"
+                " *   bx  = left-side bearing (signed; may be negative)\n"
+                " *   by  = offset from baseline to top of ink box\n"
+                " *         (negative above baseline, positive below)\n"
+                " *   w,h = tight ink box dimensions\n"
+                " *   adv = pen advance after this glyph\n"
+                " *   off = byte offset into font_aa_bitmap\n"
+                " */\n")
         f.write("struct font_aa_glyph {\n"
-                "    s16 bx;      /* left-side bearing from pen origin */\n"
-                "    s16 by;      /* top offset from the cell top      */\n"
-                "    u16 w;       /* glyph bitmap width                */\n"
-                "    u16 h;       /* glyph bitmap height               */\n"
-                "    u16 adv;     /* pen advance after this glyph      */\n"
-                "    u32 off;     /* byte offset into font_aa_bitmap   */\n"
+                "    s16 bx;\n"
+                "    s16 by;\n"
+                "    u16 w;\n"
+                "    u16 h;\n"
+                "    u16 adv;\n"
+                "    u32 off;\n"
                 "};\n\n")
         f.write("static const struct font_aa_glyph "
                 "font_aa_metrics[96] = {\n")
